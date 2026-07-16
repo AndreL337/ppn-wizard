@@ -62,6 +62,7 @@ export interface CarbonWizardInputs {
   reportingYear: string;
   netZeroTargetYear: number;
   commitmentStatement: string;
+  employeeHeadcount: number;
   scope1: Scope1Inputs;
   scope2: Scope2Inputs;
   scope3Cat4: Scope3Category4Inputs;
@@ -71,6 +72,8 @@ export interface CarbonWizardInputs {
   scope3Cat9: Scope3Category9Inputs;
   plannedReductions: string;
 }
+
+export type RawAuditInputs = CarbonWizardInputs;
 
 export interface EmissionsBreakdown {
   scope1: {
@@ -242,6 +245,7 @@ export function getInitialWizardInputs(): CarbonWizardInputs {
     reportingYear: '2025',
     netZeroTargetYear: 2050,
     commitmentStatement: 'Commitment to achieving Net Zero greenhouse gas emissions by 2050 at the latest.',
+    employeeHeadcount: 50,
     scope1: {
       naturalGasKwh: 0,
       burningOilLitres: 0,

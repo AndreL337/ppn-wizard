@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import {
   calculateEmissions,
   getInitialWizardInputs,
@@ -9,6 +9,12 @@ import {
   CarbonWizardInputs,
   EMISSION_FACTORS,
 } from '../services/emissionsCalculator';
+import { OfficialCRPTemplate } from './OfficialCRPTemplate';
+import html2canvas from 'html2canvas';
+import { jsPDF } from 'jspdf';
+import { supabase } from '../lib/supabaseClient';
+import SupabaseAuth from './SupabaseAuth';
+import { User } from '@supabase/supabase-js';
 
 export default function CarbonWizard() {
   // Wizard states
@@ -16,8 +22,382 @@ export default function CarbonWizard() {
   const [inputs, setInputs] = useState<CarbonWizardInputs>(getInitialWizardInputs());
   const [baselineInputs, setBaselineInputs] = useState<CarbonWizardInputs | null>(null);
 
+  // Benchmark toggle states
+  const [useGasBenchmark, setUseGasBenchmark] = useState<boolean>(false);
+  const [useElectricityBenchmark, setUseElectricityBenchmark] = useState<boolean>(false);
+  const [useWasteBenchmark, setUseWasteBenchmark] = useState<boolean>(false);
+  const [useCommutingBenchmark, setUseCommutingBenchmark] = useState<boolean>(false);
+
+  // Supabase save & resume states
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [saveMessage, setSaveMessage] = useState<string>('');
+
+  // Stripe & Preview/Methodology Modal states
+  const [isUnlocked, setIsUnlocked] = useState<boolean>(false);
+  const [isUnlocking, setIsUnlocking] = useState<boolean>(false);
+  const [showPreviewModal, setShowPreviewModal] = useState<boolean>(false);
+  const [showMethodologyModal, setShowMethodologyModal] = useState<boolean>(false);
+
+  // Handle Stripe Unlock Payment
+  const handleUnlockPDF = async () => {
+    setIsUnlocking(true);
+    try {
+      const res = await fetch('/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        alert(data.error || 'Failed to initiate unlock process. Please try again.');
+      }
+    } catch (err) {
+      console.error('Error initiating checkout:', err);
+      alert('Failed to connect to checkout server.');
+    } finally {
+      setIsUnlocking(false);
+    }
+  };
+
+  // Check URL query parameters and local storage for unlock state
+  React.useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const savedUnlock = localStorage.getItem('carbon_wizard_unlocked_plan');
+      if (savedUnlock === 'true') {
+        setIsUnlocked(true);
+      }
+
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('payment') === 'success') {
+        setIsUnlocked(true);
+        localStorage.setItem('carbon_wizard_unlocked_plan', 'true');
+        // Clean URL params to avoid re-triggering success toasts
+        const newUrl = window.location.pathname + window.location.hash;
+        window.history.replaceState({}, '', newUrl);
+      }
+    }
+  }, []);
+
+  const handleSaveProgress = async () => {
+    if (!currentUser) {
+      setSaveStatus('error');
+      setSaveMessage('Please sign in using your email in the "Save & Resume" card to save progress.');
+      return;
+    }
+
+    setSaveStatus('saving');
+    setSaveMessage('');
+
+    try {
+      // 1. Update Profile
+      await supabase.from('profiles').upsert({
+        id: currentUser.id,
+        company_name: inputs.organizationName,
+        employee_headcount: inputs.employeeHeadcount,
+        updated_at: new Date().toISOString()
+      });
+
+      // 2. Query for existing audit report for this user
+      const { data: existingReports } = await supabase
+        .from('audit_reports')
+        .select('id')
+        .eq('user_id', currentUser.id)
+        .order('updated_at', { ascending: false })
+        .limit(1);
+
+      const reportPayload = {
+        user_id: currentUser.id,
+        organization_name: inputs.organizationName,
+        baseline_year: inputs.baselineYear,
+        reporting_year: inputs.reportingYear,
+        net_zero_target_year: inputs.netZeroTargetYear,
+        commitment_statement: inputs.commitmentStatement,
+        employee_headcount: inputs.employeeHeadcount,
+        planned_reductions: inputs.plannedReductions,
+        scope1: inputs.scope1,
+        scope2: inputs.scope2,
+        scope3_cat4: inputs.scope3Cat4,
+        scope3_cat5: inputs.scope3Cat5,
+        scope3_cat6: inputs.scope3Cat6,
+        scope3_cat7: inputs.scope3Cat7,
+        scope3_cat9: inputs.scope3Cat9,
+        raw_inputs: {
+          inputs,
+          baselineInputs,
+          useGasBenchmark,
+          useElectricityBenchmark,
+          useWasteBenchmark,
+          useCommutingBenchmark,
+        },
+        updated_at: new Date().toISOString()
+      };
+
+      if (existingReports && existingReports.length > 0) {
+        const { error } = await supabase
+          .from('audit_reports')
+          .update(reportPayload)
+          .eq('id', existingReports[0].id);
+        
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from('audit_reports')
+          .insert(reportPayload);
+        
+        if (error) throw error;
+      }
+
+      setSaveStatus('saved');
+      setSaveMessage('Progress saved successfully to your cloud profile!');
+      setTimeout(() => {
+        setSaveStatus('idle');
+        setSaveMessage('');
+      }, 4000);
+    } catch (err: any) {
+      console.error('Error saving progress:', err);
+      setSaveStatus('error');
+      setSaveMessage(err.message || 'Failed to save progress.');
+    }
+  };
+
+  // Listen or respond when currentUser is available
+  React.useEffect(() => {
+    if (currentUser) {
+      const loadLatestDraft = async () => {
+        try {
+          const { data, error } = await supabase
+            .from('audit_reports')
+            .select('*')
+            .eq('user_id', currentUser.id)
+            .order('updated_at', { ascending: false })
+            .limit(1);
+
+          if (error) throw error;
+
+          if (data && data.length > 0) {
+            const report = data[0];
+            const raw = report.raw_inputs;
+            if (raw) {
+              if (raw.inputs) setInputs(raw.inputs);
+              if (raw.baselineInputs) setBaselineInputs(raw.baselineInputs);
+              if (raw.useGasBenchmark !== undefined) setUseGasBenchmark(raw.useGasBenchmark);
+              if (raw.useElectricityBenchmark !== undefined) setUseElectricityBenchmark(raw.useElectricityBenchmark);
+              if (raw.useWasteBenchmark !== undefined) setUseWasteBenchmark(raw.useWasteBenchmark);
+              if (raw.useCommutingBenchmark !== undefined) setUseCommutingBenchmark(raw.useCommutingBenchmark);
+            }
+          }
+        } catch (err) {
+          console.error('Error loading latest draft:', err);
+        }
+      };
+      loadLatestDraft();
+    }
+  }, [currentUser]);
+
+  const pdfTemplateRef = useRef<HTMLDivElement>(null);
+  const [isDownloading, setIsDownloading] = useState<boolean>(false);
+
+  const handleDownloadPDF = async () => {
+    const element = pdfTemplateRef.current;
+    if (!element) return;
+    setIsDownloading(true);
+
+    try {
+      const canvas = await html2canvas(element, {
+        scale: 2,
+        useCORS: true,
+        logging: false,
+        backgroundColor: '#ffffff',
+      });
+
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const pdfHeight = pdf.internal.pageSize.getHeight();
+
+      const canvasWidth = canvas.width;
+      const canvasHeight = canvas.height;
+
+      const imgWidth = pdfWidth;
+      const imgHeight = (canvasHeight * pdfWidth) / canvasWidth;
+
+      let heightLeft = imgHeight;
+      let position = 0;
+
+      // Add first page
+      pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight, undefined, 'FAST');
+      heightLeft -= pdfHeight;
+
+      // Add extra pages if needed
+      while (heightLeft >= 0) {
+        position = heightLeft - imgHeight;
+        pdf.addPage();
+        pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight, undefined, 'FAST');
+        heightLeft -= pdfHeight;
+      }
+
+      const orgSlug = (inputs.organizationName || 'supplier').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      pdf.save(`Carbon-Reduction-Plan-${orgSlug}.pdf`);
+    } catch (err) {
+      console.error('Error generating PDF:', err);
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
+  // Keep auto-populated benchmark values synchronized when employee headcount changes
+  React.useEffect(() => {
+    if (useGasBenchmark) {
+      setInputs((prev) => ({
+        ...prev,
+        scope1: {
+          ...prev.scope1,
+          naturalGasKwh: prev.employeeHeadcount * 1200,
+        },
+      }));
+    }
+  }, [inputs.employeeHeadcount, useGasBenchmark]);
+
+  React.useEffect(() => {
+    if (useElectricityBenchmark) {
+      setInputs((prev) => ({
+        ...prev,
+        scope2: {
+          ...prev.scope2,
+          gridElectricityKwh: prev.employeeHeadcount * 950,
+        },
+      }));
+    }
+  }, [inputs.employeeHeadcount, useElectricityBenchmark]);
+
+  React.useEffect(() => {
+    if (useWasteBenchmark) {
+      setInputs((prev) => ({
+        ...prev,
+        scope3Cat5: {
+          ...prev.scope3Cat5,
+          landfillTonnes: Number((prev.employeeHeadcount * 0.1).toFixed(2)),
+          recycledTonnes: Number((prev.employeeHeadcount * 0.1).toFixed(2)),
+        },
+      }));
+    }
+  }, [inputs.employeeHeadcount, useWasteBenchmark]);
+
+  React.useEffect(() => {
+    if (useCommutingBenchmark) {
+      setInputs((prev) => ({
+        ...prev,
+        scope3Cat7: {
+          ...prev.scope3Cat7,
+          commuteCarKm: prev.employeeHeadcount * 1007,
+        },
+      }));
+    }
+  }, [inputs.employeeHeadcount, useCommutingBenchmark]);
+
   // Sub-sections for Scope 3 in Step 4
   const [activeScope3Tab, setActiveScope3Tab] = useState<'cat4' | 'cat5' | 'cat6' | 'cat7' | 'cat9'>('cat4');
+
+  // Benchmark Toggle Handlers
+  const handleToggleGasBenchmark = (checked: boolean) => {
+    setUseGasBenchmark(checked);
+    if (checked) {
+      setInputs((prev) => ({
+        ...prev,
+        scope1: {
+          ...prev.scope1,
+          naturalGasKwh: prev.employeeHeadcount * 1200,
+        },
+      }));
+    } else {
+      setInputs((prev) => ({
+        ...prev,
+        scope1: {
+          ...prev.scope1,
+          naturalGasKwh: 0,
+        },
+      }));
+    }
+  };
+
+  const handleToggleElectricityBenchmark = (checked: boolean) => {
+    setUseElectricityBenchmark(checked);
+    if (checked) {
+      setInputs((prev) => ({
+        ...prev,
+        scope2: {
+          ...prev.scope2,
+          gridElectricityKwh: prev.employeeHeadcount * 950,
+        },
+      }));
+    } else {
+      setInputs((prev) => ({
+        ...prev,
+        scope2: {
+          ...prev.scope2,
+          gridElectricityKwh: 0,
+        },
+      }));
+    }
+  };
+
+  const handleToggleWasteBenchmark = (checked: boolean) => {
+    setUseWasteBenchmark(checked);
+    if (checked) {
+      setInputs((prev) => ({
+        ...prev,
+        scope3Cat5: {
+          ...prev.scope3Cat5,
+          landfillTonnes: Number((prev.employeeHeadcount * 0.1).toFixed(2)),
+          recycledTonnes: Number((prev.employeeHeadcount * 0.1).toFixed(2)),
+          combustedTonnes: 0,
+          compostedTonnes: 0,
+        },
+      }));
+    } else {
+      setInputs((prev) => ({
+        ...prev,
+        scope3Cat5: {
+          ...prev.scope3Cat5,
+          landfillTonnes: 0,
+          recycledTonnes: 0,
+          combustedTonnes: 0,
+          compostedTonnes: 0,
+        },
+      }));
+    }
+  };
+
+  const handleToggleCommutingBenchmark = (checked: boolean) => {
+    setUseCommutingBenchmark(checked);
+    if (checked) {
+      setInputs((prev) => ({
+        ...prev,
+        scope3Cat7: {
+          ...prev.scope3Cat7,
+          commuteCarKm: prev.employeeHeadcount * 1007,
+          commuteCarUnit: 'miles',
+          commuteRailKm: 0,
+          commuteBusKm: 0,
+          wfhDays: 0,
+        },
+      }));
+    } else {
+      setInputs((prev) => ({
+        ...prev,
+        scope3Cat7: {
+          ...prev.scope3Cat7,
+          commuteCarKm: 0,
+          commuteCarUnit: 'miles',
+          commuteRailKm: 0,
+          commuteBusKm: 0,
+          wfhDays: 0,
+        },
+      }));
+    }
+  };
 
   // Input helpers
   const handleInputChange = (
@@ -227,6 +607,21 @@ export default function CarbonWizard() {
                       ))}
                     </select>
                   </div>
+
+                  <div className="space-y-1 md:col-span-2 bg-emerald-50/50 p-4 rounded-xl border border-emerald-100">
+                    <label className="text-xs font-bold uppercase tracking-wider text-[#006D5B]">Employee Headcount</label>
+                    <input
+                      type="number"
+                      min="1"
+                      className="w-full border border-slate-200 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-[#006D5B] focus:border-[#006D5B] bg-white mt-1"
+                      placeholder="e.g. 50"
+                      value={inputs.employeeHeadcount || ''}
+                      onChange={(e) => handleInputChange(null, 'employeeHeadcount', parseInt(e.target.value) || 0)}
+                    />
+                    <p className="text-xs text-slate-500 mt-1">
+                      Required for auto-calculating regional and industry UK greenhouse gas benchmarks.
+                    </p>
+                  </div>
                 </div>
 
                 <div className="space-y-2">
@@ -271,19 +666,56 @@ export default function CarbonWizard() {
                   </p>
                 </div>
 
+                {/* Onboarding Benchmark Toggle */}
+                <div className="bg-emerald-50/20 p-4 rounded-xl border border-emerald-100 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                  <div className="space-y-0.5">
+                    <p className="text-xs font-bold uppercase tracking-wider text-[#006D5B]">UK Average Benchmarking</p>
+                    <p className="text-xs text-slate-500">
+                      Auto-calculate gas consumption based on your <strong>{inputs.employeeHeadcount || 0} employees</strong>.
+                    </p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      className="sr-only peer"
+                      checked={useGasBenchmark}
+                      onChange={(e) => handleToggleGasBenchmark(e.target.checked)}
+                    />
+                    <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-emerald-500/20 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-[#006D5B]"></div>
+                    <span className="ml-3 text-xs font-bold text-slate-700">I don't have this data, use UK average benchmarks based on my headcount</span>
+                  </label>
+                </div>
+
+                {useGasBenchmark && (
+                  <div className="p-3 bg-emerald-50 rounded-lg border border-emerald-100 flex items-start gap-3">
+                    <svg className="w-5 h-5 text-emerald-700 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <div className="text-xs text-emerald-800 leading-relaxed">
+                      <strong>CIBSE Benchmark Applied</strong>: This estimation utilizes the official UK CIBSE (Chartered Institution of Building Services Engineers) Guide F average benchmark of <strong>1,200 kWh</strong> of natural gas per employee per year for standard commercial premises.
+                    </div>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="space-y-1 bg-slate-50 p-3 rounded-lg border border-slate-200">
+                  <div className={`space-y-1 p-3 rounded-lg border transition-all ${useGasBenchmark ? 'bg-emerald-50/50 border-emerald-200 shadow-inner' : 'bg-slate-50 border-slate-200'}`}>
                     <div className="flex justify-between items-center">
-                      <label className="text-xs font-bold uppercase tracking-wider text-slate-500">Natural Gas</label>
-                      <span className="text-xs text-slate-400">kWh</span>
+                      <label className={`text-xs font-bold uppercase tracking-wider ${useGasBenchmark ? 'text-[#006D5B]' : 'text-slate-500'}`}>Natural Gas</label>
+                      <span className="text-xs text-slate-400 font-bold">kWh</span>
                     </div>
                     <input
                       type="number"
-                      className="w-full border border-slate-200 rounded-lg p-2 text-sm bg-white"
+                      disabled={useGasBenchmark}
+                      className={`w-full border rounded-lg p-2 text-sm transition-colors ${useGasBenchmark ? 'bg-[#E8F5E9] text-[#1B5E20] font-black border-emerald-300' : 'bg-white border-slate-200'}`}
                       value={inputs.scope1.naturalGasKwh || ''}
                       placeholder="0"
                       onChange={(e) => handleInputChange('scope1', 'naturalGasKwh', parseFloat(e.target.value) || 0)}
                     />
+                    {useGasBenchmark && (
+                      <span className="text-[10px] text-emerald-700 font-bold uppercase tracking-wider block mt-1">
+                        ★ Auto-populated (1,200 kWh per employee/yr)
+                      </span>
+                    )}
                   </div>
 
                   <div className="space-y-1 bg-slate-50 p-3 rounded-lg border border-slate-200">
@@ -385,19 +817,56 @@ export default function CarbonWizard() {
                   </p>
                 </div>
 
+                {/* Electricity Benchmark Toggle */}
+                <div className="bg-emerald-50/20 p-4 rounded-xl border border-emerald-100 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                  <div className="space-y-0.5">
+                    <p className="text-xs font-bold uppercase tracking-wider text-[#006D5B]">UK Average Benchmarking</p>
+                    <p className="text-xs text-slate-500">
+                      Auto-calculate electricity consumption based on your <strong>{inputs.employeeHeadcount || 0} employees</strong>.
+                    </p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      className="sr-only peer"
+                      checked={useElectricityBenchmark}
+                      onChange={(e) => handleToggleElectricityBenchmark(e.target.checked)}
+                    />
+                    <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-emerald-500/20 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-[#006D5B]"></div>
+                    <span className="ml-3 text-xs font-bold text-slate-700">I don't have this data, use UK average benchmarks based on my headcount</span>
+                  </label>
+                </div>
+
+                {useElectricityBenchmark && (
+                  <div className="p-3 bg-emerald-50 rounded-lg border border-emerald-100 flex items-start gap-3">
+                    <svg className="w-5 h-5 text-emerald-700 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <div className="text-xs text-emerald-800 leading-relaxed">
+                      <strong>CIBSE Electricity Benchmarks Applied</strong>: This estimation utilizes the official UK CIBSE (Chartered Institution of Building Services Engineers) Guide F average benchmark of <strong>950 kWh</strong> of grid electricity per employee per year for commercial offices.
+                    </div>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="space-y-1 bg-slate-50 p-4 rounded-lg border border-slate-200 md:col-span-2">
+                  <div className={`p-4 rounded-lg border md:col-span-2 transition-all ${useElectricityBenchmark ? 'bg-emerald-50/50 border-emerald-200 shadow-inner' : 'bg-slate-50 border-slate-200'}`}>
                     <div className="flex justify-between items-center">
-                      <label className="text-sm font-bold uppercase tracking-wider text-slate-500">Purchased Electricity</label>
-                      <span className="text-xs text-slate-400">kWh</span>
+                      <label className={`text-sm font-bold uppercase tracking-wider ${useElectricityBenchmark ? 'text-[#006D5B]' : 'text-slate-500'}`}>Purchased Electricity</label>
+                      <span className="text-xs text-slate-400 font-bold">kWh</span>
                     </div>
                     <input
                       type="number"
-                      className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-white mt-1"
+                      disabled={useElectricityBenchmark}
+                      className={`w-full border rounded-lg p-2.5 text-sm mt-1 transition-colors ${useElectricityBenchmark ? 'bg-[#E8F5E9] text-[#1B5E20] font-black border-emerald-300' : 'bg-white border-slate-200'}`}
                       value={inputs.scope2.gridElectricityKwh || ''}
                       placeholder="e.g. 52000"
                       onChange={(e) => handleInputChange('scope2', 'gridElectricityKwh', parseFloat(e.target.value) || 0)}
                     />
+                    {useElectricityBenchmark && (
+                      <span className="text-[10px] text-emerald-700 font-bold uppercase tracking-wider block mt-1">
+                        ★ Auto-populated (950 kWh per employee/yr)
+                      </span>
+                    )}
                   </div>
 
                   <div className="space-y-1 bg-slate-50 p-4 rounded-lg border border-slate-200 md:col-span-2">
@@ -564,45 +1033,90 @@ export default function CarbonWizard() {
                         <p className="text-xs text-slate-500 mt-0.5">Disposal and treatment of waste generated in your organization's owned or controlled operations.</p>
                       </div>
 
+                      {/* Waste Benchmark Toggle */}
+                      <div className="bg-emerald-50/20 p-4 rounded-xl border border-emerald-100 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                        <div className="space-y-0.5">
+                          <p className="text-xs font-bold uppercase tracking-wider text-[#006D5B]">UK Average Benchmarking</p>
+                          <p className="text-xs text-slate-500">
+                            Auto-calculate operational waste based on your <strong>{inputs.employeeHeadcount || 0} employees</strong>.
+                          </p>
+                        </div>
+                        <label className="relative inline-flex items-center cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            className="sr-only peer"
+                            checked={useWasteBenchmark}
+                            onChange={(e) => handleToggleWasteBenchmark(e.target.checked)}
+                          />
+                          <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-emerald-500/20 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-[#006D5B]"></div>
+                          <span className="ml-3 text-xs font-bold text-slate-700">I don't have this data, use UK average benchmarks based on my headcount</span>
+                        </label>
+                      </div>
+
+                      {useWasteBenchmark && (
+                        <div className="p-3 bg-emerald-50 rounded-lg border border-emerald-100 flex items-start gap-3">
+                          <svg className="w-5 h-5 text-emerald-700 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                          <div className="text-xs text-emerald-800 leading-relaxed">
+                            <strong>UK Waste Benchmark Applied</strong>: This estimation utilizes the standard UK waste generation statistics of approximately <strong>0.2 tonnes</strong> of waste per employee per year for office environments, allocated 50% to general landfill waste and 50% to recycling streams.
+                          </div>
+                        </div>
+                      )}
+
                       <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-slate-500">Landfill Waste (Tonnes)</label>
+                        <div className={`space-y-1 p-2 rounded-lg border transition-all ${useWasteBenchmark ? 'bg-emerald-50/50 border-emerald-200 shadow-inner' : 'bg-transparent border-transparent'}`}>
+                          <label className={`text-xs font-bold uppercase ${useWasteBenchmark ? 'text-[#006D5B]' : 'text-slate-500'}`}>Landfill Waste (Tonnes)</label>
                           <input
                             type="number"
-                            className="w-full border border-slate-200 rounded-lg p-2 text-sm"
+                            disabled={useWasteBenchmark}
+                            className={`w-full border rounded-lg p-2 text-sm ${useWasteBenchmark ? 'bg-[#E8F5E9] text-[#1B5E20] font-black border-emerald-300' : 'bg-white border-slate-200'}`}
                             placeholder="0"
                             value={inputs.scope3Cat5.landfillTonnes || ''}
                             onChange={(e) => handleInputChange('scope3Cat5', 'landfillTonnes', parseFloat(e.target.value) || 0)}
                           />
+                          {useWasteBenchmark && (
+                            <span className="text-[10px] text-emerald-700 font-bold uppercase tracking-wider block mt-1">
+                              ★ Auto-populated (0.1 t/employee/yr)
+                            </span>
+                          )}
                         </div>
 
-                        <div className="space-y-1">
+                        <div className="space-y-1 p-2">
                           <label className="text-xs font-bold uppercase text-slate-500">Combusted / Incinerated (Tonnes)</label>
                           <input
                             type="number"
-                            className="w-full border border-slate-200 rounded-lg p-2 text-sm"
+                            disabled={useWasteBenchmark}
+                            className={`w-full border rounded-lg p-2 text-sm ${useWasteBenchmark ? 'bg-slate-50 text-slate-400 border-slate-200' : 'bg-white border-slate-200'}`}
                             placeholder="0"
                             value={inputs.scope3Cat5.combustedTonnes || ''}
                             onChange={(e) => handleInputChange('scope3Cat5', 'combustedTonnes', parseFloat(e.target.value) || 0)}
                           />
                         </div>
 
-                        <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-slate-500">Recycled Waste (Tonnes)</label>
+                        <div className={`space-y-1 p-2 rounded-lg border transition-all ${useWasteBenchmark ? 'bg-emerald-50/50 border-emerald-200 shadow-inner' : 'bg-transparent border-transparent'}`}>
+                          <label className={`text-xs font-bold uppercase ${useWasteBenchmark ? 'text-[#006D5B]' : 'text-slate-500'}`}>Recycled Waste (Tonnes)</label>
                           <input
                             type="number"
-                            className="w-full border border-slate-200 rounded-lg p-2 text-sm"
+                            disabled={useWasteBenchmark}
+                            className={`w-full border rounded-lg p-2 text-sm ${useWasteBenchmark ? 'bg-[#E8F5E9] text-[#1B5E20] font-black border-emerald-300' : 'bg-white border-slate-200'}`}
                             placeholder="0"
                             value={inputs.scope3Cat5.recycledTonnes || ''}
                             onChange={(e) => handleInputChange('scope3Cat5', 'recycledTonnes', parseFloat(e.target.value) || 0)}
                           />
+                          {useWasteBenchmark && (
+                            <span className="text-[10px] text-emerald-700 font-bold uppercase tracking-wider block mt-1">
+                              ★ Auto-populated (0.1 t/employee/yr)
+                            </span>
+                          )}
                         </div>
 
-                        <div className="space-y-1">
+                        <div className="space-y-1 p-2">
                           <label className="text-xs font-bold uppercase text-slate-500">Organic Composted (Tonnes)</label>
                           <input
                             type="number"
-                            className="w-full border border-slate-200 rounded-lg p-2 text-sm"
+                            disabled={useWasteBenchmark}
+                            className={`w-full border rounded-lg p-2 text-sm ${useWasteBenchmark ? 'bg-slate-50 text-slate-400 border-slate-200' : 'bg-white border-slate-200'}`}
                             placeholder="0"
                             value={inputs.scope3Cat5.compostedTonnes || ''}
                             onChange={(e) => handleInputChange('scope3Cat5', 'compostedTonnes', parseFloat(e.target.value) || 0)}
@@ -719,13 +1233,45 @@ export default function CarbonWizard() {
                         <p className="text-xs text-slate-500 mt-0.5">Transportation of employees between their homes and worksites, including working from home / teleworking energy.</p>
                       </div>
 
+                      {/* Commute Benchmark Toggle */}
+                      <div className="bg-emerald-50/20 p-4 rounded-xl border border-emerald-100 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                        <div className="space-y-0.5">
+                          <p className="text-xs font-bold uppercase tracking-wider text-[#006D5B]">UK Average Benchmarking</p>
+                          <p className="text-xs text-slate-500">
+                            Auto-calculate travel distance based on your <strong>{inputs.employeeHeadcount || 0} employees</strong>.
+                          </p>
+                        </div>
+                        <label className="relative inline-flex items-center cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            className="sr-only peer"
+                            checked={useCommutingBenchmark}
+                            onChange={(e) => handleToggleCommutingBenchmark(e.target.checked)}
+                          />
+                          <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-emerald-500/20 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-[#006D5B]"></div>
+                          <span className="ml-3 text-xs font-bold text-slate-700">I don't have this data, use UK average benchmarks based on my headcount</span>
+                        </label>
+                      </div>
+
+                      {useCommutingBenchmark && (
+                        <div className="p-3 bg-emerald-50 rounded-lg border border-emerald-100 flex items-start gap-3">
+                          <svg className="w-5 h-5 text-emerald-700 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                          <div className="text-xs text-emerald-800 leading-relaxed">
+                            <strong>UK DfT Commuting Benchmark Applied</strong>: This estimation utilizes the UK Department for Transport (DfT) National Travel Survey average commute distance of approximately <strong>1,007 miles</strong> per employee per year for private transport users.
+                          </div>
+                        </div>
+                      )}
+
                       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                        <div className="space-y-1 col-span-2">
+                        <div className={`space-y-1 col-span-2 p-2 rounded-lg border transition-all ${useCommutingBenchmark ? 'bg-emerald-50/50 border-emerald-200 shadow-inner' : 'bg-transparent border-transparent'}`}>
                           <div className="flex justify-between items-center">
-                            <label className="text-xs font-bold uppercase text-slate-500">Commuting by Private Car</label>
+                            <label className={`text-xs font-bold uppercase ${useCommutingBenchmark ? 'text-[#006D5B]' : 'text-slate-500'}`}>Commuting by Private Car</label>
                             <div className="flex gap-1 border border-slate-200 rounded bg-white p-0.5 text-[8px]">
                               <button
                                 type="button"
+                                disabled={useCommutingBenchmark}
                                 className={`px-1 rounded ${inputs.scope3Cat7.commuteCarUnit === 'miles' ? 'bg-emerald-600 text-white font-semibold' : 'text-slate-600'}`}
                                 onClick={() => handleInputChange('scope3Cat7', 'commuteCarUnit', 'miles')}
                               >
@@ -733,6 +1279,7 @@ export default function CarbonWizard() {
                               </button>
                               <button
                                 type="button"
+                                disabled={useCommutingBenchmark}
                                 className={`px-1 rounded ${inputs.scope3Cat7.commuteCarUnit === 'km' ? 'bg-emerald-600 text-white font-semibold' : 'text-slate-600'}`}
                                 onClick={() => handleInputChange('scope3Cat7', 'commuteCarUnit', 'km')}
                               >
@@ -742,29 +1289,37 @@ export default function CarbonWizard() {
                           </div>
                           <input
                             type="number"
-                            className="w-full border border-slate-200 rounded-lg p-1.5 text-sm mt-0.5"
+                            disabled={useCommutingBenchmark}
+                            className={`w-full border rounded-lg p-1.5 text-sm mt-0.5 ${useCommutingBenchmark ? 'bg-[#E8F5E9] text-[#1B5E20] font-black border-emerald-300' : 'bg-white border-slate-200'}`}
                             placeholder="0"
                             value={inputs.scope3Cat7.commuteCarKm || ''}
                             onChange={(e) => handleInputChange('scope3Cat7', 'commuteCarKm', parseFloat(e.target.value) || 0)}
                           />
+                          {useCommutingBenchmark && (
+                            <span className="text-[10px] text-emerald-700 font-bold uppercase tracking-wider block mt-1">
+                              ★ Auto-populated (1,007 miles/employee/yr)
+                            </span>
+                          )}
                         </div>
 
-                        <div className="space-y-1">
+                        <div className="space-y-1 p-2">
                           <label className="text-xs font-bold uppercase text-slate-500">Commuting Rail (km)</label>
                           <input
                             type="number"
-                            className="w-full border border-slate-200 rounded-lg p-1.5 text-sm"
+                            disabled={useCommutingBenchmark}
+                            className={`w-full border rounded-lg p-1.5 text-sm ${useCommutingBenchmark ? 'bg-slate-50 text-slate-400 border-slate-200' : 'bg-white border-slate-200'}`}
                             placeholder="0"
                             value={inputs.scope3Cat7.commuteRailKm || ''}
                             onChange={(e) => handleInputChange('scope3Cat7', 'commuteRailKm', parseFloat(e.target.value) || 0)}
                           />
                         </div>
 
-                        <div className="space-y-1">
+                        <div className="space-y-1 p-2">
                           <label className="text-xs font-bold uppercase text-slate-500">Commuting Bus (km)</label>
                           <input
                             type="number"
-                            className="w-full border border-slate-200 rounded-lg p-1.5 text-sm"
+                            disabled={useCommutingBenchmark}
+                            className={`w-full border rounded-lg p-1.5 text-sm ${useCommutingBenchmark ? 'bg-slate-50 text-slate-400 border-slate-200' : 'bg-white border-slate-200'}`}
                             placeholder="0"
                             value={inputs.scope3Cat7.commuteBusKm || ''}
                             onChange={(e) => handleInputChange('scope3Cat7', 'commuteBusKm', parseFloat(e.target.value) || 0)}
@@ -778,7 +1333,8 @@ export default function CarbonWizard() {
                           </div>
                           <input
                             type="number"
-                            className="w-full border border-slate-200 rounded-lg p-1.5 text-sm bg-white mt-1"
+                            disabled={useCommutingBenchmark}
+                            className={`w-full border border-slate-200 rounded-lg p-1.5 text-sm bg-white mt-1 ${useCommutingBenchmark ? 'bg-slate-50 text-slate-400 border-slate-200' : 'bg-white'}`}
                             placeholder="e.g. 180"
                             value={inputs.scope3Cat7.wfhDays || ''}
                             onChange={(e) => handleInputChange('scope3Cat7', 'wfhDays', parseFloat(e.target.value) || 0)}
@@ -1015,47 +1571,183 @@ export default function CarbonWizard() {
           </div>
 
           {/* Stepper controls */}
-          <div className="flex justify-between items-center border-t border-slate-100 pt-6 mt-8">
-            <button
-              type="button"
-              className={`flex items-center gap-1.5 text-xs font-bold uppercase text-slate-500 hover:text-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors`}
-              disabled={currentStep === 1}
-              onClick={() => setCurrentStep((prev) => prev - 1)}
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-              </svg>
-              Previous Step
-            </button>
-
-            {currentStep < totalSteps ? (
-              <button
-                type="button"
-                className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold uppercase tracking-wider px-5 py-2.5 rounded-lg transition-all shadow-md flex items-center gap-1.5"
-                onClick={() => setCurrentStep((prev) => prev + 1)}
+          <div className="flex flex-col gap-4 border-t border-slate-100 pt-6 mt-8">
+            {saveMessage && (
+              <div
+                className={`p-3.5 rounded-xl text-xs font-bold leading-relaxed border ${
+                  saveStatus === 'saved'
+                    ? 'bg-emerald-50 border-emerald-100 text-emerald-800'
+                    : 'bg-rose-50 border-rose-100 text-rose-800'
+                }`}
               >
-                Next Step
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                </svg>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => window.print()}
-                className="bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold uppercase tracking-wider px-6 py-2.5 rounded-lg transition-all shadow-md flex items-center gap-1.5"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" />
-                </svg>
-                Print Compliance Plan
-              </button>
+                {saveMessage}
+              </div>
             )}
+            <div className="flex justify-between items-center w-full flex-wrap gap-4">
+              <button
+                type="button"
+                className="flex items-center gap-1.5 text-xs font-bold uppercase text-slate-500 hover:text-slate-800 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                disabled={currentStep === 1}
+                onClick={() => setCurrentStep((prev) => prev - 1)}
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+                </svg>
+                Previous Step
+              </button>
+
+              <div className="flex items-center gap-3 flex-wrap">
+                {/* Always-accessible Save Progress button */}
+                <button
+                  type="button"
+                  onClick={handleSaveProgress}
+                  disabled={saveStatus === 'saving'}
+                  className="border border-emerald-600 hover:border-emerald-700 text-emerald-700 hover:bg-emerald-50/50 disabled:bg-slate-50 disabled:text-slate-400 disabled:border-slate-200 text-xs font-bold uppercase tracking-wider px-5 py-2.5 rounded-lg transition-all shadow-sm flex items-center gap-1.5"
+                >
+                  {saveStatus === 'saving' ? (
+                    <>
+                      <svg className="animate-spin -ml-0.5 mr-1 h-3.5 w-3.5 text-emerald-600" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                      </svg>
+                      Saving...
+                    </>
+                  ) : saveStatus === 'saved' ? (
+                    <>
+                      <svg className="w-3.5 h-3.5 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
+                      </svg>
+                      Saved!
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
+                      </svg>
+                      Save Progress
+                    </>
+                  )}
+                </button>
+
+                {currentStep < totalSteps ? (
+                  <button
+                    type="button"
+                    className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold uppercase tracking-wider px-5 py-2.5 rounded-lg transition-all shadow-md flex items-center gap-1.5"
+                    onClick={() => setCurrentStep((prev) => prev + 1)}
+                  >
+                    Next Step
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                    </svg>
+                  </button>
+                ) : (
+                  <>
+                    {!isUnlocked ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => setShowPreviewModal(true)}
+                          className="bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold uppercase tracking-wider px-5 py-2.5 rounded-lg transition-all shadow-md flex items-center gap-1.5"
+                        >
+                          <svg className="w-4 h-4 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                          </svg>
+                          View Preview
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleUnlockPDF}
+                          disabled={isUnlocking}
+                          className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 disabled:from-slate-300 disabled:to-slate-300 text-white text-xs font-extrabold uppercase tracking-wider px-6 py-2.5 rounded-lg transition-all shadow-md flex items-center gap-2 animate-pulse"
+                        >
+                          <svg className="w-4 h-4 text-emerald-100" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                          </svg>
+                          {isUnlocking ? 'Unlocking...' : 'Unlock Official Board-Approved PDF'}
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={handleDownloadPDF}
+                          disabled={isDownloading}
+                          className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-800/50 text-white text-xs font-bold uppercase tracking-wider px-6 py-2.5 rounded-lg transition-all shadow-md flex items-center gap-1.5"
+                        >
+                          {isDownloading ? (
+                            <>
+                              <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                              </svg>
+                              Generating PDF...
+                            </>
+                          ) : (
+                            <>
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                              </svg>
+                              Download PPN PDF
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => window.print()}
+                          className="bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold uppercase tracking-wider px-6 py-2.5 rounded-lg transition-all shadow-md flex items-center gap-1.5"
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" />
+                          </svg>
+                          Print
+                        </button>
+                      </>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
           </div>
         </div>
 
         {/* Right 1 Col: Live Audit Dashboard & Visuals */}
         <div className="space-y-6">
+          {/* Supabase Save & Resume Widget */}
+          <SupabaseAuth onSessionActive={setCurrentUser} />
+
+          {/* Compliance Guarantee Badge */}
+          <div className="bg-gradient-to-br from-emerald-50 to-teal-50 border border-emerald-200 rounded-2xl p-5 space-y-3 shadow-sm relative overflow-hidden">
+            <div className="absolute top-0 right-0 transform translate-x-2 -translate-y-2 text-emerald-100 opacity-40 pointer-events-none">
+              <svg className="w-24 h-24" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" />
+              </svg>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-600 text-white text-[10px] font-black">
+                ✓
+              </span>
+              <h4 className="text-xs font-black text-emerald-950 uppercase tracking-wider">
+                Compliance Guarantee
+              </h4>
+            </div>
+            <p className="text-xs text-emerald-900 leading-relaxed font-semibold">
+              Calculations aligned with the 2026 DESNZ Greenhouse Gas Conversion Factors and the UK Cabinet Office PPN 06/21 Annex A methodology.
+            </p>
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowMethodologyModal(true)}
+                className="text-xs text-emerald-700 hover:text-emerald-800 font-extrabold underline decoration-emerald-300 underline-offset-4 hover:decoration-emerald-500 transition-all flex items-center gap-1"
+              >
+                Verify Methodology
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+
           {/* Emission breakdown chart */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-md p-6 space-y-4">
             <h3 className="text-sm font-extrabold uppercase tracking-wide text-slate-900 border-b border-slate-100 pb-2">
@@ -1313,7 +2005,7 @@ export default function CarbonWizard() {
         </div>
 
         {/* Board Approval Sign off */}
-        <div className="space-y-6 pt-6 border-t border-slate-200">
+        <div className="space-y-6 pt-6 border-t border-slate-200 relative">
           <h3 className="text-lg font-bold text-slate-900">
             5. Declaration and Sign-off
           </h3>
@@ -1324,7 +2016,7 @@ export default function CarbonWizard() {
             This Carbon Reduction Plan has been reviewed and signed off by the board of directors (or equivalent management body).
           </p>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-8 pt-4 text-sm">
+          <div className={`grid grid-cols-1 md:grid-cols-2 gap-8 pt-4 text-sm relative ${!isUnlocked ? 'filter blur-[3px] select-none pointer-events-none' : ''}`}>
             <div className="border-t border-slate-300 pt-3 space-y-1">
               <p className="text-xs text-slate-400 font-bold uppercase">Signed on behalf of the Supplier:</p>
               <div className="h-10 flex items-end">
@@ -1341,8 +2033,180 @@ export default function CarbonWizard() {
               </div>
             </div>
           </div>
+
+          {!isUnlocked && (
+            <div className="absolute inset-0 bg-slate-900/5 backdrop-blur-[2px] flex items-center justify-center rounded-xl p-6">
+              <div className="bg-white/95 border border-slate-200 shadow-xl rounded-2xl p-6 text-center max-w-sm space-y-3 z-10">
+                <div className="bg-amber-100 text-amber-800 rounded-full w-10 h-10 flex items-center justify-center mx-auto">
+                  <svg className="w-5 h-5 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                  </svg>
+                </div>
+                <h4 className="text-xs font-black text-slate-900 uppercase tracking-wider">
+                  Official Sign-off Block Locked
+                </h4>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  Your carbon calculations and trajectory reports are ready. Unlock to generate high-contrast signature lines, remove watermarks, and download the full compliant PPN PDF.
+                </p>
+                <div className="flex gap-2 justify-center">
+                  <button
+                    type="button"
+                    onClick={() => setShowPreviewModal(true)}
+                    className="bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold uppercase tracking-wider px-3.5 py-2 rounded-lg transition-colors"
+                  >
+                    Preview Document
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleUnlockPDF}
+                    disabled={isUnlocking}
+                    className="bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold uppercase tracking-wider px-3.5 py-2 rounded-lg transition-colors"
+                  >
+                    Unlock PDF (£195)
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
+
+      {/* Hidden container for PDF rendering */}
+      <div style={{ position: 'absolute', left: '-9999px', top: '-9999px', overflow: 'hidden', height: 0 }}>
+        <OfficialCRPTemplate
+          ref={pdfTemplateRef}
+          inputs={inputs}
+          baselineEmissions={baselineEmissions}
+          reportingEmissions={reportingEmissions}
+          emissionsChangePercentage={emissionsChangePercentage}
+          isPreview={!isUnlocked}
+        />
+      </div>
+
+      {/* Methodology Verification Modal */}
+      {showMethodologyModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-100 space-y-4 relative">
+            <button
+              type="button"
+              onClick={() => setShowMethodologyModal(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-slate-600 transition-colors"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+            
+            <div className="flex items-center gap-3 border-b border-slate-100 pb-3">
+              <div className="bg-emerald-100 text-emerald-800 rounded-full p-2">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-sm font-black text-slate-900 uppercase tracking-wide">
+                  Methodology Verification
+                </h3>
+                <p className="text-xs text-slate-500">Compliance & Calculation Standards</p>
+              </div>
+            </div>
+
+            <div className="space-y-3 text-xs text-slate-600 leading-relaxed">
+              <p>
+                Our assessment engine is custom-configured to provide complete compliance with the 
+                <strong> Greenhouse Gas Protocol Corporate Standard</strong>, the global standard for carbon footprint reporting.
+              </p>
+              <p>
+                We execute calculation pipelines following these strict parameters:
+              </p>
+              <ul className="list-disc pl-5 space-y-1">
+                <li><strong>Scope 1:</strong> Natural Gas usage mapped against official 2026 DESNZ Direct Emission factors (expressed in kgCO₂e per kWh).</li>
+                <li><strong>Scope 2:</strong> Grid electricity calculated via Location-based grid factors aligned with 2026 DESNZ grid intensity metrics.</li>
+                <li><strong>Scope 3:</strong> Includes all five mandatory categories under UK Procurement Policy Note PPN 06/21: Upstream Transportation & Distribution (Cat 4), Operational Waste (Cat 5), Business Travel (Cat 6), Employee Commuting (Cat 7), and Downstream Transportation & Distribution (Cat 9).</li>
+              </ul>
+              <p className="bg-emerald-50/50 p-3 rounded-lg border border-emerald-100 text-emerald-950 font-medium">
+                Every calculation is validated to confirm full mathematical correctness, removing audit-readiness risk for corporate public tenders.
+              </p>
+            </div>
+
+            <div className="flex justify-end pt-2">
+              <button
+                type="button"
+                onClick={() => setShowMethodologyModal(false)}
+                className="bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold uppercase tracking-wider px-5 py-2.5 rounded-lg transition-colors"
+              >
+                Close Verification
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Preview Modal (Watermarked CRP Plan) */}
+      {showPreviewModal && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <div className="bg-slate-100 rounded-3xl max-w-4xl w-full my-8 shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[90vh]">
+            {/* Header */}
+            <div className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between sticky top-0 z-10">
+              <div className="flex items-center gap-2">
+                <span className="bg-amber-100 text-amber-800 text-[10px] font-black tracking-widest uppercase px-2.5 py-1 rounded-full border border-amber-200 flex items-center gap-1">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-ping"></span>
+                  Watermarked Preview
+                </span>
+                <h3 className="text-sm font-black text-slate-950 uppercase tracking-wide">
+                  Your Carbon Reduction Plan Trajectory
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPreviewModal(false)}
+                className="text-slate-400 hover:text-slate-600 transition-colors p-1"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Scrollable Container with the actual watermarked document */}
+            <div className="p-6 overflow-y-auto flex-1 bg-slate-50 flex justify-center">
+              <div className="bg-white shadow-lg rounded-2xl overflow-hidden p-2">
+                <OfficialCRPTemplate
+                  inputs={inputs}
+                  baselineEmissions={baselineEmissions}
+                  reportingEmissions={reportingEmissions}
+                  emissionsChangePercentage={emissionsChangePercentage}
+                  isPreview={true}
+                />
+              </div>
+            </div>
+
+            {/* Sticky Footer */}
+            <div className="bg-white border-t border-slate-200 px-6 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 sticky bottom-0 z-10 shadow-lg">
+              <p className="text-xs text-slate-500 max-w-md">
+                This is a secure preview. Unlock the official Board-Approved PDF to get high-contrast signature lines, remove all watermarks, and download/print your ready-to-file CRP.
+              </p>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowPreviewModal(false)}
+                  className="border border-slate-200 hover:border-slate-300 text-slate-700 text-xs font-bold uppercase tracking-wider px-5 py-2.5 rounded-lg transition-colors"
+                >
+                  Close Preview
+                </button>
+                <button
+                  type="button"
+                  disabled={isUnlocking}
+                  onClick={handleUnlockPDF}
+                  className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white text-xs font-bold uppercase tracking-wider px-5 py-2.5 rounded-lg transition-all shadow-md flex items-center gap-1.5"
+                >
+                  {isUnlocking ? 'Unlocking...' : 'Unlock Official Board-Approved PDF'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
