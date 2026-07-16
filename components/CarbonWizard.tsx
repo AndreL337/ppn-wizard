@@ -8,6 +8,7 @@ import {
   EmissionsBreakdown,
   CarbonWizardInputs,
   EMISSION_FACTORS,
+  getEffectiveScope3Methodology,
 } from '../services/emissionsCalculator';
 import { OfficialCRPTemplate } from './OfficialCRPTemplate';
 import html2canvas from 'html2canvas';
@@ -196,6 +197,111 @@ export default function CarbonWizard() {
     }
   }, [currentUser]);
 
+  const saveAuditRecord = async (reportId?: string) => {
+    if (!currentUser) return null;
+    
+    try {
+      let finalReportId = reportId;
+      if (!finalReportId) {
+        const { data: existingReports } = await supabase
+          .from('audit_reports')
+          .select('id')
+          .eq('user_id', currentUser.id)
+          .order('updated_at', { ascending: false })
+          .limit(1);
+        if (existingReports && existingReports.length > 0) {
+          finalReportId = existingReports[0].id;
+        }
+      }
+
+      if (!finalReportId) {
+        // Automatically save current draft first to ensure the audit report exists
+        await handleSaveProgress();
+        const { data: newReports } = await supabase
+          .from('audit_reports')
+          .select('id')
+          .eq('user_id', currentUser.id)
+          .order('updated_at', { ascending: false })
+          .limit(1);
+        if (newReports && newReports.length > 0) {
+          finalReportId = newReports[0].id;
+        }
+      }
+
+      if (!finalReportId) {
+        console.warn('Could not determine report ID for snapshot.');
+        return null;
+      }
+
+      // Save factors snapshot to carbon_audits table
+      const { data: auditData, error: auditError } = await supabase
+        .from('carbon_audits')
+        .insert({
+          user_id: currentUser.id,
+          report_id: finalReportId,
+          factor_set_version: '2026-v1.0',
+          audited_factors_snapshot: EMISSION_FACTORS,
+        })
+        .select()
+        .single();
+
+      if (auditError) throw auditError;
+      if (!auditData) return null;
+
+      const auditId = auditData.id;
+
+      // Map Scope 3 calculation notes & methodology basis to scope3_records
+      const scope3Records = [
+        {
+          audit_id: auditId,
+          category: 'Category 4: Upstream Transportation & Distribution',
+          emissions_tco2e: reportingEmissions.scope3.cat4UpstreamTrans,
+          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat4'),
+          calculation_notes: JSON.stringify(inputs.scope3Cat4),
+        },
+        {
+          audit_id: auditId,
+          category: 'Category 5: Operational Waste',
+          emissions_tco2e: reportingEmissions.scope3.cat5OperationalWaste,
+          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat5', useWasteBenchmark, useCommutingBenchmark),
+          calculation_notes: JSON.stringify(inputs.scope3Cat5),
+        },
+        {
+          audit_id: auditId,
+          category: 'Category 6: Business Travel',
+          emissions_tco2e: reportingEmissions.scope3.cat6BusinessTravel,
+          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat6'),
+          calculation_notes: JSON.stringify(inputs.scope3Cat6),
+        },
+        {
+          audit_id: auditId,
+          category: 'Category 7: Employee Commuting',
+          emissions_tco2e: reportingEmissions.scope3.cat7EmployeeCommuting,
+          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat7', useWasteBenchmark, useCommutingBenchmark),
+          calculation_notes: JSON.stringify(inputs.scope3Cat7),
+        },
+        {
+          audit_id: auditId,
+          category: 'Category 9: Downstream Transportation & Distribution',
+          emissions_tco2e: reportingEmissions.scope3.cat9DownstreamTrans,
+          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat9'),
+          calculation_notes: JSON.stringify(inputs.scope3Cat9),
+        },
+      ];
+
+      const { error: scope3Error } = await supabase
+        .from('scope3_records')
+        .insert(scope3Records);
+
+      if (scope3Error) throw scope3Error;
+      console.log('Successfully saved forensic audit snapshot and scope 3 records.');
+      return auditId;
+    } catch (error) {
+      console.error('Error saving forensic audit snapshot:', error);
+      return null;
+    }
+  };
+
   const pdfTemplateRef = useRef<HTMLDivElement>(null);
   const [isDownloading, setIsDownloading] = useState<boolean>(false);
 
@@ -205,6 +311,11 @@ export default function CarbonWizard() {
     setIsDownloading(true);
 
     try {
+      // Save forensic audit records on report finalization/download
+      if (currentUser) {
+        await saveAuditRecord();
+      }
+
       const canvas = await html2canvas(element, {
         scale: 2,
         useCORS: true,
@@ -486,7 +597,7 @@ export default function CarbonWizard() {
   };
 
   return (
-    <div className="w-full max-w-6xl mx-auto p-4 md:p-8 space-y-8 bg-[#F8FAFC] min-h-screen text-slate-800 font-sans">
+    <div id="carbon-wizard" className="w-full max-w-6xl mx-auto p-4 md:p-8 space-y-8 bg-[#F8FAFC] min-h-screen text-slate-800 font-sans scroll-mt-6">
       {/* SaaS Branding Header */}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between border-b border-slate-200 pb-6">
         <div>
@@ -1021,6 +1132,18 @@ export default function CarbonWizard() {
                           />
                           <p className="text-[10px] text-slate-400">Directly add pre-calculated tCO₂e values from carbon-offset delivery invoices.</p>
                         </div>
+
+                        <div className="space-y-1 md:col-span-2 border-t border-slate-100 pt-3">
+                          <label className="text-xs font-bold uppercase text-slate-500">Methodology Basis / Calculation Notes</label>
+                          <textarea
+                            rows={2}
+                            className="w-full border border-slate-200 rounded-lg p-2 text-sm focus:ring-2 focus:ring-[#006D5B] focus:border-[#006D5B] bg-white mt-1"
+                            placeholder="Leave blank to automatically generate standard UK Government PPN-compliant description..."
+                            value={inputs.scope3Cat4.methodologyBasis || ''}
+                            onChange={(e) => handleInputChange('scope3Cat4', 'methodologyBasis', e.target.value)}
+                          />
+                          <p className="text-[10px] text-slate-400">Specify any custom sampling techniques, supplier verification data, or data gaps addressed.</p>
+                        </div>
                       </div>
                     </div>
                   )}
@@ -1122,6 +1245,18 @@ export default function CarbonWizard() {
                             onChange={(e) => handleInputChange('scope3Cat5', 'compostedTonnes', parseFloat(e.target.value) || 0)}
                           />
                         </div>
+
+                        <div className="space-y-1 col-span-2 border-t border-slate-100 pt-3 mt-2">
+                          <label className="text-xs font-bold uppercase text-slate-500">Methodology Basis / Calculation Notes</label>
+                          <textarea
+                            rows={2}
+                            className="w-full border border-slate-200 rounded-lg p-2 text-sm focus:ring-2 focus:ring-[#006D5B] focus:border-[#006D5B] bg-white mt-1"
+                            placeholder="Leave blank to automatically generate standard UK Government PPN-compliant description..."
+                            value={inputs.scope3Cat5.methodologyBasis || ''}
+                            onChange={(e) => handleInputChange('scope3Cat5', 'methodologyBasis', e.target.value)}
+                          />
+                          <p className="text-[10px] text-slate-400">Specify any custom waste tracking databases, dumpster volume estimations, or supplier data sheets used.</p>
+                        </div>
                       </div>
                     </div>
                   )}
@@ -1222,6 +1357,18 @@ export default function CarbonWizard() {
                       <p className="text-[10px] text-slate-400">
                         * p-km (Passenger-Kilometre) corresponds to total distance traveled multiplied by number of corporate passengers.
                       </p>
+
+                      <div className="space-y-1 border-t border-slate-100 pt-3 mt-2">
+                        <label className="text-xs font-bold uppercase text-slate-500">Methodology Basis / Calculation Notes</label>
+                        <textarea
+                          rows={2}
+                          className="w-full border border-slate-200 rounded-lg p-2 text-sm focus:ring-2 focus:ring-[#006D5B] focus:border-[#006D5B] bg-white mt-1"
+                          placeholder="Leave blank to automatically generate standard UK Government PPN-compliant description..."
+                          value={inputs.scope3Cat6.methodologyBasis || ''}
+                          onChange={(e) => handleInputChange('scope3Cat6', 'methodologyBasis', e.target.value)}
+                        />
+                        <p className="text-[10px] text-slate-400">Specify travel agent report imports, mileage expense claims database sources, or airline class radiative forcing adjustments applied.</p>
+                      </div>
                     </div>
                   )}
 
@@ -1343,6 +1490,18 @@ export default function CarbonWizard() {
                             Sum of remote days worked across all employees. Accounts for incremental heating and power usage as recommended by modern carbon accounting standards.
                           </p>
                         </div>
+
+                        <div className="space-y-1 col-span-2 md:col-span-4 border-t border-slate-100 pt-3 mt-2">
+                          <label className="text-xs font-bold uppercase text-slate-500">Methodology Basis / Calculation Notes</label>
+                          <textarea
+                            rows={2}
+                            className="w-full border border-slate-200 rounded-lg p-2 text-sm focus:ring-2 focus:ring-[#006D5B] focus:border-[#006D5B] bg-white mt-1"
+                            placeholder="Leave blank to automatically generate standard UK Government PPN-compliant description..."
+                            value={inputs.scope3Cat7.methodologyBasis || ''}
+                            onChange={(e) => handleInputChange('scope3Cat7', 'methodologyBasis', e.target.value)}
+                          />
+                          <p className="text-[10px] text-slate-400">Specify any commuting surveys administered, average distance estimations, or teleworking energy calculation models used.</p>
+                        </div>
                       </div>
                     </div>
                   )}
@@ -1408,6 +1567,18 @@ export default function CarbonWizard() {
                             onChange={(e) => handleInputChange('scope3Cat9', 'flatTCO2e', parseFloat(e.target.value) || 0)}
                           />
                           <p className="text-[10px] text-slate-400">Directly add pre-calculated tCO₂e values from downstream logistics providers.</p>
+                        </div>
+
+                        <div className="space-y-1 md:col-span-2 border-t border-slate-100 pt-3">
+                          <label className="text-xs font-bold uppercase text-slate-500">Methodology Basis / Calculation Notes</label>
+                          <textarea
+                            rows={2}
+                            className="w-full border border-slate-200 rounded-lg p-2 text-sm focus:ring-2 focus:ring-[#006D5B] focus:border-[#006D5B] bg-white mt-1"
+                            placeholder="Leave blank to automatically generate standard UK Government PPN-compliant description..."
+                            value={inputs.scope3Cat9.methodologyBasis || ''}
+                            onChange={(e) => handleInputChange('scope3Cat9', 'methodologyBasis', e.target.value)}
+                          />
+                          <p className="text-[10px] text-slate-400">Specify any downstream carrier logistics data sets, weight-mileage estimations, or distributor telemetry logs analyzed.</p>
                         </div>
                       </div>
                     </div>
@@ -2080,6 +2251,8 @@ export default function CarbonWizard() {
           reportingEmissions={reportingEmissions}
           emissionsChangePercentage={emissionsChangePercentage}
           isPreview={!isUnlocked}
+          useWasteBenchmark={useWasteBenchmark}
+          useCommutingBenchmark={useCommutingBenchmark}
         />
       </div>
 
@@ -2177,6 +2350,8 @@ export default function CarbonWizard() {
                   reportingEmissions={reportingEmissions}
                   emissionsChangePercentage={emissionsChangePercentage}
                   isPreview={true}
+                  useWasteBenchmark={useWasteBenchmark}
+                  useCommutingBenchmark={useCommutingBenchmark}
                 />
               </div>
             </div>

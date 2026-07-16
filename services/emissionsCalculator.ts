@@ -22,6 +22,7 @@ export interface Scope3Category4Inputs {
   vanKm: number;
   vanUnit: 'km' | 'miles';
   flatTCO2e: number;
+  methodologyBasis?: string;
 }
 
 export interface Scope3Category5Inputs {
@@ -29,6 +30,7 @@ export interface Scope3Category5Inputs {
   combustedTonnes: number;
   recycledTonnes: number;
   compostedTonnes: number;
+  methodologyBasis?: string;
 }
 
 export interface Scope3Category6Inputs {
@@ -39,6 +41,7 @@ export interface Scope3Category6Inputs {
   carKm: number;
   carUnit: 'km' | 'miles';
   busPkm: number;
+  methodologyBasis?: string;
 }
 
 export interface Scope3Category7Inputs {
@@ -47,6 +50,7 @@ export interface Scope3Category7Inputs {
   commuteRailKm: number;
   commuteBusKm: number;
   wfhDays: number; // Work from home days (for teleworking emissions)
+  methodologyBasis?: string;
 }
 
 export interface Scope3Category9Inputs {
@@ -54,6 +58,7 @@ export interface Scope3Category9Inputs {
   vanKm: number;
   vanUnit: 'km' | 'miles';
   flatTCO2e: number;
+  methodologyBasis?: string;
 }
 
 export interface CarbonWizardInputs {
@@ -99,49 +104,14 @@ export interface EmissionsBreakdown {
   grandTotal: number;
 }
 
-// UK Government Conversion Factors (kg CO2e per unit)
-export const EMISSION_FACTORS = {
-  scope1: {
-    naturalGasKwh: 0.18293,       // kg CO2e per kWh
-    burningOilLitre: 2.54012,     // kg CO2e per litre
-    dieselLitre: 2.51233,         // kg CO2e per litre
-    petrolLitre: 2.16244,         // kg CO2e per litre
-    carKm: 0.16492,               // kg CO2e per km (Average local passenger car)
-  },
-  scope2: {
-    electricityGridKwh: 0.20706,  // kg CO2e per kWh (UK grid electricity)
-  },
-  scope3: {
-    cat4: {
-      hgvTonneKm: 0.10478,        // kg CO2e per tonne-km
-      vanKm: 0.23512,             // kg CO2e per km
-    },
-    cat5: {
-      landfillTonne: 439.52,      // kg CO2e per tonne of municipal waste to landfill
-      combustedTonne: 21.84,      // kg CO2e per tonne of municipal waste combusted
-      recycledTonne: 21.28,       // kg CO2e per tonne of recycled waste
-      compostedTonne: 5.82,       // kg CO2e per tonne of composted organic waste
-    },
-    cat6: {
-      domesticFlightPkm: 0.24455,  // kg CO2e per passenger-km (UK domestic)
-      shortHaulFlightPkm: 0.15124, // kg CO2e per passenger-km (Short-haul international, European)
-      longHaulFlightPkm: 0.19310,  // kg CO2e per passenger-km (Long-haul international)
-      railPkm: 0.03549,            // kg CO2e per passenger-km (National Rail)
-      carKm: 0.16492,              // kg CO2e per km (Average passenger car)
-      busPkm: 0.09612,             // kg CO2e per passenger-km (Local bus / coach)
-    },
-    cat7: {
-      commuteCarKm: 0.16492,       // kg CO2e per km
-      commuteRailPkm: 0.03549,     // kg CO2e per passenger-km
-      commuteBusPkm: 0.09612,      // kg CO2e per passenger-km
-      wfhDay: 0.34,                // kg CO2e per day (teleworking home energy allowance)
-    },
-    cat9: {
-      hgvTonneKm: 0.10478,        // kg CO2e per tonne-km
-      vanKm: 0.23512,             // kg CO2e per km
-    },
-  },
+import factors2026 from './factors/2026.json';
+
+export const EmissionLibrary = {
+  '2026': factors2026,
 };
+
+// UK Government Conversion Factors (kg CO2e per unit) - Default 2026 factors
+export const EMISSION_FACTORS = factors2026;
 
 const MILES_TO_KM = 1.609344;
 
@@ -153,59 +123,61 @@ function convertDistanceToKm(value: number, unit: 'km' | 'miles'): number {
  * Calculates emissions based on UK Gov GHG Conversion Factors.
  * Returns emissions in metric Tonnes of CO2e (tCO2e) which is the required unit for PPN 06/21.
  */
-export function calculateEmissions(inputs: CarbonWizardInputs): EmissionsBreakdown {
+export function calculateEmissions(inputs: CarbonWizardInputs, version: string = '2026'): EmissionsBreakdown {
+  const factors = EmissionLibrary[version as keyof typeof EmissionLibrary] || EMISSION_FACTORS;
+
   // --- SCOPE 1 CALCULATIONS ---
-  const gasEmissions = (inputs.scope1.naturalGasKwh * EMISSION_FACTORS.scope1.naturalGasKwh) / 1000;
-  const oilEmissions = (inputs.scope1.burningOilLitres * EMISSION_FACTORS.scope1.burningOilLitre) / 1000;
-  const dieselEmissions = (inputs.scope1.dieselLitres * EMISSION_FACTORS.scope1.dieselLitre) / 1000;
-  const petrolEmissions = (inputs.scope1.petrolLitres * EMISSION_FACTORS.scope1.petrolLitre) / 1000;
+  const gasEmissions = (inputs.scope1.naturalGasKwh * factors.scope1.naturalGasKwh) / 1000;
+  const oilEmissions = (inputs.scope1.burningOilLitres * factors.scope1.burningOilLitre) / 1000;
+  const dieselEmissions = (inputs.scope1.dieselLitres * factors.scope1.dieselLitre) / 1000;
+  const petrolEmissions = (inputs.scope1.petrolLitres * factors.scope1.petrolLitre) / 1000;
 
   const companyOwnedKm = convertDistanceToKm(inputs.scope1.companyOwnedKm, inputs.scope1.companyOwnedUnit);
-  const companyOwnedEmissions = (companyOwnedKm * EMISSION_FACTORS.scope1.carKm) / 1000;
+  const companyOwnedEmissions = (companyOwnedKm * factors.scope1.carKm) / 1000;
 
   const scope1Total = gasEmissions + oilEmissions + dieselEmissions + petrolEmissions + companyOwnedEmissions;
 
   // --- SCOPE 2 CALCULATIONS ---
-  const gridElectricityEmissions = (inputs.scope2.gridElectricityKwh * EMISSION_FACTORS.scope2.electricityGridKwh) / 1000;
+  const gridElectricityEmissions = (inputs.scope2.gridElectricityKwh * factors.scope2.electricityGridKwh) / 1000;
   const scope2Total = gridElectricityEmissions;
 
   // --- SCOPE 3 CALCULATIONS (PPN 06/21 Mandatory Categories) ---
 
   // Category 4: Upstream Transportation & Distribution
-  const cat4HgvKm = inputs.scope3Cat4.hgvTonneKm * EMISSION_FACTORS.scope3.cat4.hgvTonneKm;
+  const cat4HgvKm = inputs.scope3Cat4.hgvTonneKm * factors.scope3.cat4.hgvTonneKm;
   const cat4VanKmConverted = convertDistanceToKm(inputs.scope3Cat4.vanKm, inputs.scope3Cat4.vanUnit);
-  const cat4VanEmissions = cat4VanKmConverted * EMISSION_FACTORS.scope3.cat4.vanKm;
+  const cat4VanEmissions = cat4VanKmConverted * factors.scope3.cat4.vanKm;
   const cat4Total = (cat4HgvKm + cat4VanEmissions) / 1000 + inputs.scope3Cat4.flatTCO2e;
 
   // Category 5: Operational Waste
-  const wasteLandfill = inputs.scope3Cat5.landfillTonnes * EMISSION_FACTORS.scope3.cat5.landfillTonne;
-  const wasteCombusted = inputs.scope3Cat5.combustedTonnes * EMISSION_FACTORS.scope3.cat5.combustedTonne;
-  const wasteRecycled = inputs.scope3Cat5.recycledTonnes * EMISSION_FACTORS.scope3.cat5.recycledTonne;
-  const wasteComposted = inputs.scope3Cat5.compostedTonnes * EMISSION_FACTORS.scope3.cat5.compostedTonne;
+  const wasteLandfill = inputs.scope3Cat5.landfillTonnes * factors.scope3.cat5.landfillTonne;
+  const wasteCombusted = inputs.scope3Cat5.combustedTonnes * factors.scope3.cat5.combustedTonne;
+  const wasteRecycled = inputs.scope3Cat5.recycledTonnes * factors.scope3.cat5.recycledTonne;
+  const wasteComposted = inputs.scope3Cat5.compostedTonnes * factors.scope3.cat5.compostedTonne;
   const cat5Total = (wasteLandfill + wasteCombusted + wasteRecycled + wasteComposted) / 1000;
 
   // Category 6: Business Travel
-  const domesticFlightEmissions = inputs.scope3Cat6.domesticFlightPkm * EMISSION_FACTORS.scope3.cat6.domesticFlightPkm;
-  const shortHaulFlightEmissions = inputs.scope3Cat6.shortHaulFlightPkm * EMISSION_FACTORS.scope3.cat6.shortHaulFlightPkm;
-  const longHaulFlightEmissions = inputs.scope3Cat6.longHaulFlightPkm * EMISSION_FACTORS.scope3.cat6.longHaulFlightPkm;
-  const railEmissions = inputs.scope3Cat6.railPkm * EMISSION_FACTORS.scope3.cat6.railPkm;
+  const domesticFlightEmissions = inputs.scope3Cat6.domesticFlightPkm * factors.scope3.cat6.domesticFlightPkm;
+  const shortHaulFlightEmissions = inputs.scope3Cat6.shortHaulFlightPkm * factors.scope3.cat6.shortHaulFlightPkm;
+  const longHaulFlightEmissions = inputs.scope3Cat6.longHaulFlightPkm * factors.scope3.cat6.longHaulFlightPkm;
+  const railEmissions = inputs.scope3Cat6.railPkm * factors.scope3.cat6.railPkm;
   const businessCarKmConverted = convertDistanceToKm(inputs.scope3Cat6.carKm, inputs.scope3Cat6.carUnit);
-  const businessCarEmissions = businessCarKmConverted * EMISSION_FACTORS.scope3.cat6.carKm;
-  const busEmissions = inputs.scope3Cat6.busPkm * EMISSION_FACTORS.scope3.cat6.busPkm;
+  const businessCarEmissions = businessCarKmConverted * factors.scope3.cat6.carKm;
+  const busEmissions = inputs.scope3Cat6.busPkm * factors.scope3.cat6.busPkm;
   const cat6Total = (domesticFlightEmissions + shortHaulFlightEmissions + longHaulFlightEmissions + railEmissions + businessCarEmissions + busEmissions) / 1000;
 
   // Category 7: Employee Commuting
   const commuteCarKmConverted = convertDistanceToKm(inputs.scope3Cat7.commuteCarKm, inputs.scope3Cat7.commuteCarUnit);
-  const commuteCarEmissions = commuteCarKmConverted * EMISSION_FACTORS.scope3.cat7.commuteCarKm;
-  const commuteRailEmissions = inputs.scope3Cat7.commuteRailKm * EMISSION_FACTORS.scope3.cat7.commuteRailPkm;
-  const commuteBusEmissions = inputs.scope3Cat7.commuteBusKm * EMISSION_FACTORS.scope3.cat7.commuteBusPkm;
-  const commuteWfhEmissions = inputs.scope3Cat7.wfhDays * EMISSION_FACTORS.scope3.cat7.wfhDay;
+  const commuteCarEmissions = commuteCarKmConverted * factors.scope3.cat7.commuteCarKm;
+  const commuteRailEmissions = inputs.scope3Cat7.commuteRailKm * factors.scope3.cat7.commuteRailPkm;
+  const commuteBusEmissions = inputs.scope3Cat7.commuteBusKm * factors.scope3.cat7.commuteBusPkm;
+  const commuteWfhEmissions = inputs.scope3Cat7.wfhDays * factors.scope3.cat7.wfhDay;
   const cat7Total = (commuteCarEmissions + commuteRailEmissions + commuteBusEmissions + commuteWfhEmissions) / 1000;
 
   // Category 9: Downstream Transportation & Distribution
-  const cat9HgvKm = inputs.scope3Cat9.hgvTonneKm * EMISSION_FACTORS.scope3.cat9.hgvTonneKm;
+  const cat9HgvKm = inputs.scope3Cat9.hgvTonneKm * factors.scope3.cat9.hgvTonneKm;
   const cat9VanKmConverted = convertDistanceToKm(inputs.scope3Cat9.vanKm, inputs.scope3Cat9.vanUnit);
-  const cat9VanEmissions = cat9VanKmConverted * EMISSION_FACTORS.scope3.cat9.vanKm;
+  const cat9VanEmissions = cat9VanKmConverted * factors.scope3.cat9.vanKm;
   const cat9Total = (cat9HgvKm + cat9VanEmissions) / 1000 + inputs.scope3Cat9.flatTCO2e;
 
   const scope3Total = cat4Total + cat5Total + cat6Total + cat7Total + cat9Total;
@@ -263,12 +235,14 @@ export function getInitialWizardInputs(): CarbonWizardInputs {
       vanKm: 0,
       vanUnit: 'miles',
       flatTCO2e: 0,
+      methodologyBasis: '',
     },
     scope3Cat5: {
       landfillTonnes: 0,
       combustedTonnes: 0,
       recycledTonnes: 0,
       compostedTonnes: 0,
+      methodologyBasis: '',
     },
     scope3Cat6: {
       domesticFlightPkm: 0,
@@ -278,6 +252,7 @@ export function getInitialWizardInputs(): CarbonWizardInputs {
       carKm: 0,
       carUnit: 'miles',
       busPkm: 0,
+      methodologyBasis: '',
     },
     scope3Cat7: {
       commuteCarKm: 0,
@@ -285,12 +260,14 @@ export function getInitialWizardInputs(): CarbonWizardInputs {
       commuteRailKm: 0,
       commuteBusKm: 0,
       wfhDays: 0,
+      methodologyBasis: '',
     },
     scope3Cat9: {
       hgvTonneKm: 0,
       vanKm: 0,
       vanUnit: 'miles',
       flatTCO2e: 0,
+      methodologyBasis: '',
     },
     plannedReductions: '',
   };
@@ -353,3 +330,47 @@ export function generateSampleBaseline(reportingInputs: CarbonWizardInputs): Car
     },
   };
 }
+
+export function getEffectiveScope3Methodology(
+  inputs: CarbonWizardInputs,
+  category: 'cat4' | 'cat5' | 'cat6' | 'cat7' | 'cat9',
+  useWasteBenchmark: boolean = false,
+  useCommutingBenchmark: boolean = false
+): string {
+  switch (category) {
+    case 'cat4':
+      if (inputs.scope3Cat4.methodologyBasis?.trim()) {
+        return inputs.scope3Cat4.methodologyBasis;
+      }
+      return `Standard distance-based method using 2026 DESNZ factors for HGV (0.10478 kg/t-km) and Van (0.23512 kg/km). Parameters: ${inputs.scope3Cat4.hgvTonneKm} t-km HGV, ${inputs.scope3Cat4.vanKm} ${inputs.scope3Cat4.vanUnit} Van, Override: ${inputs.scope3Cat4.flatTCO2e} tCO2e.`;
+    case 'cat5':
+      if (inputs.scope3Cat5.methodologyBasis?.trim()) {
+        return inputs.scope3Cat5.methodologyBasis;
+      }
+      if (useWasteBenchmark) {
+        return `UK Average Benchmarking: Estimated 0.2 tonnes of operational waste per employee per year for ${inputs.employeeHeadcount} employees (allocated 50% landfill, 50% recycling).`;
+      }
+      return `Waste tonnage method using 2026 factors: Landfill ${inputs.scope3Cat5.landfillTonnes}t, Combusted ${inputs.scope3Cat5.combustedTonnes}t, Recycled ${inputs.scope3Cat5.recycledTonnes}t, Composted ${inputs.scope3Cat5.compostedTonnes}t.`;
+    case 'cat6':
+      if (inputs.scope3Cat6.methodologyBasis?.trim()) {
+        return inputs.scope3Cat6.methodologyBasis;
+      }
+      return `Passenger-kilometer (pkm) calculation using 2026 factors. Parameters: Rail: ${inputs.scope3Cat6.railPkm} pkm, Domestic flights: ${inputs.scope3Cat6.domesticFlightPkm} pkm, Short-haul: ${inputs.scope3Cat6.shortHaulFlightPkm} pkm, Long-haul: ${inputs.scope3Cat6.longHaulFlightPkm} pkm, Car: ${inputs.scope3Cat6.carKm} ${inputs.scope3Cat6.carUnit}, Bus: ${inputs.scope3Cat6.busPkm} pkm.`;
+    case 'cat7':
+      if (inputs.scope3Cat7.methodologyBasis?.trim()) {
+        return inputs.scope3Cat7.methodologyBasis;
+      }
+      if (useCommutingBenchmark) {
+        return `UK DfT Commuting Benchmarking: Estimated travel distance (1,007 miles/employee/year) for ${inputs.employeeHeadcount} employees plus standard WFH teleworking energy allowance (0.34 kg CO2e/day) for telecommuters.`;
+      }
+      return `Commuter vehicle mileage + teleworking allowance method. Parameters: Road: ${inputs.scope3Cat7.commuteCarKm} ${inputs.scope3Cat7.commuteCarUnit}, Rail: ${inputs.scope3Cat7.commuteRailKm} km, Bus: ${inputs.scope3Cat7.commuteBusKm} km. WFH: ${inputs.scope3Cat7.wfhDays} remote days.`;
+    case 'cat9':
+      if (inputs.scope3Cat9.methodologyBasis?.trim()) {
+        return inputs.scope3Cat9.methodologyBasis;
+      }
+      return `Standard distance-based downstream logistics method using 2026 DESNZ factors. Parameters: ${inputs.scope3Cat9.hgvTonneKm} t-km HGV, ${inputs.scope3Cat9.vanKm} ${inputs.scope3Cat9.vanUnit} Van, Override: ${inputs.scope3Cat9.flatTCO2e} tCO2e.`;
+    default:
+      return '';
+  }
+}
+

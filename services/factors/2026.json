@@ -1,0 +1,43 @@
+{
+  "version": "2026-v1.0",
+  "scope1": {
+    "naturalGasKwh": 0.18293,
+    "burningOilLitre": 2.54012,
+    "dieselLitre": 2.51233,
+    "petrolLitre": 2.16244,
+    "carKm": 0.16492
+  },
+  "scope2": {
+    "electricityGridKwh": 0.13096
+  },
+  "scope3": {
+    "cat4": {
+      "hgvTonneKm": 0.10478,
+      "vanKm": 0.23512
+    },
+    "cat5": {
+      "landfillTonne": 439.52,
+      "combustedTonne": 21.84,
+      "recycledTonne": 21.28,
+      "compostedTonne": 5.82
+    },
+    "cat6": {
+      "domesticFlightPkm": 0.24455,
+      "shortHaulFlightPkm": 0.15124,
+      "longHaulFlightPkm": 0.19310,
+      "railPkm": 0.03549,
+      "carKm": 0.16492,
+      "busPkm": 0.09612
+    },
+    "cat7": {
+      "commuteCarKm": 0.16492,
+      "commuteRailPkm": 0.03549,
+      "commuteBusPkm": 0.09612,
+      "wfhDay": 0.34
+    },
+    "cat9": {
+      "hgvTonneKm": 0.10478,
+      "vanKm": 0.23512
+    }
+  }
+}
