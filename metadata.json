@@ -1,0 +1,6 @@
+{
+  "name": "Carbon Wizard",
+  "description": "UK PPN 06/21 Compliance Carbon Reduction Plan Generator",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
