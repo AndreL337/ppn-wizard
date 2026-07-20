@@ -106,6 +106,121 @@ export interface EmissionsBreakdown {
 
 import factors2026 from './factors/2026.json';
 
+// Safe require for factors/hash.json to support local dev where it might be absent
+let factorsHash: { hash: string } | null = null;
+try {
+  // Use CommonJS require to avoid static import compilation errors when file is absent
+  const req = typeof require !== 'undefined' ? require : undefined;
+  if (req) {
+    factorsHash = req('./factors/hash.json');
+  }
+} catch (e) {
+  console.warn('factors/hash.json is not present. Integrity check will fall back to runtime computation.');
+}
+
+// Canonical JSON deep-sort stringification to guarantee whitespace/format immunity
+function canonicalStringify(obj: any): string {
+  if (obj === null || typeof obj !== 'object') {
+    return JSON.stringify(obj);
+  }
+  if (Array.isArray(obj)) {
+    return '[' + obj.map(canonicalStringify).join(',') + ']';
+  }
+  const keys = Object.keys(obj).sort();
+  const properties = keys.map(key => {
+    return JSON.stringify(key) + ':' + canonicalStringify(obj[key]);
+  });
+  return '{' + properties.join(',') + '}';
+}
+
+function sha256Sync(str: string): string {
+  const hexcase = 0;
+  function safe_add(x: number, y: number) {
+    const lsw = (x & 0xFFFF) + (y & 0xFFFF);
+    const msw = (x >> 16) + (y >> 16) + (lsw >> 16);
+    return (msw << 16) | (lsw & 0xFFFF);
+  }
+  function S(X: number, n: number) { return (X >>> n) | (X << (32 - n)); }
+  function R(X: number, n: number) { return (X >>> n); }
+  function Ch(x: number, y: number, z: number) { return ((x & y) ^ ((~x) & z)); }
+  function Maj(x: number, y: number, z: number) { return ((x & y) ^ (x & z) ^ (y & z)); }
+  function Sigma0256(x: number) { return (S(x, 2) ^ S(x, 13) ^ S(x, 22)); }
+  function Sigma1256(x: number) { return (S(x, 6) ^ S(x, 11) ^ S(x, 25)); }
+  function gamma0256(x: number) { return (S(x, 7) ^ S(x, 18) ^ R(x, 3)); }
+  function gamma1256(x: number) { return (S(x, 17) ^ S(x, 19) ^ R(x, 10)); }
+  function core_sha256(m: number[], l: number) {
+    const K = [
+      0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
+      0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+    const HASH = [
+      0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+    ];
+    const W = new Array(64);
+    let a, b, c, d, e, f, g, h;
+    let T1, T2;
+    m[l >> 5] |= 0x80 << (24 - l % 32);
+    m[((l + 64 >> 9) << 4) + 15] = l;
+    for (let i = 0; i < m.length; i += 16) {
+      a = HASH[0]; b = HASH[1]; c = HASH[2]; d = HASH[3]; e = HASH[4]; f = HASH[5]; g = HASH[6]; h = HASH[7];
+      for (let j = 0; j < 64; j++) {
+        if (j < 16) W[j] = m[i + j];
+        else W[j] = safe_add(safe_add(safe_add(gamma1256(W[j - 2]), W[j - 7]), gamma0256(W[j - 15])), W[j - 16]);
+        T1 = safe_add(safe_add(safe_add(safe_add(h, Sigma1256(e)), Ch(e, f, g)), K[j]), W[j]);
+        T2 = safe_add(Sigma0256(a), Maj(a, b, c));
+        h = g; g = f; f = e; e = safe_add(d, T1); d = c; c = b; b = a; a = safe_add(T1, T2);
+      }
+      HASH[0] = safe_add(a, HASH[0]); HASH[1] = safe_add(b, HASH[1]); HASH[2] = safe_add(c, HASH[2]);
+      HASH[3] = safe_add(d, HASH[3]); HASH[4] = safe_add(e, HASH[4]); HASH[5] = safe_add(f, HASH[5]);
+      HASH[6] = safe_add(g, HASH[6]); HASH[7] = safe_add(h, HASH[7]);
+    }
+    return HASH;
+  }
+  function bytes2binb(bytes: Uint8Array) {
+    const bin: number[] = [];
+    for (let i = 0; i < bytes.length * 8; i += 8) {
+      const idx = i >> 5;
+      const byteValue = bytes[i / 8];
+      bin[idx] = (bin[idx] || 0) | (byteValue << (24 - i % 32));
+    }
+    return bin;
+  }
+  function binb2hex(binarray: number[]) {
+    const hex_tab = hexcase ? '0123456789ABCDEF' : '0123456789abcdef';
+    let str = '';
+    for (let i = 0; i < binarray.length * 4; i++) {
+      str += hex_tab.charAt((binarray[i >> 2] >> ((3 - i % 4) * 8 + 4)) & 0xF) +
+             hex_tab.charAt((binarray[i >> 2] >> ((3 - i % 4) * 8)) & 0xF);
+    }
+    return str;
+  }
+  const bytes = new TextEncoder().encode(str);
+  return binb2hex(core_sha256(bytes2binb(bytes), bytes.length * 8));
+}
+
+function verifyFactorsIntegrity() {
+  try {
+    const canonicalContent = canonicalStringify(factors2026);
+    const computedHash = sha256Sync(canonicalContent);
+    if (factorsHash && computedHash !== factorsHash.hash) {
+      console.warn(`WARNING: Integrity mismatch between factors and build hash. Computed: ${computedHash}, Pinned: ${factorsHash.hash}`);
+    } else if (!factorsHash) {
+      console.info('factors/hash.json is absent. Pinned hash integrity check skipped.');
+    }
+  } catch (err) {
+    console.error('Error verifying factors integrity:', err);
+  }
+}
+
+// Runtime Self-Check
+verifyFactorsIntegrity();
+
 export const EmissionLibrary = {
   '2026': factors2026,
 };
@@ -340,33 +455,33 @@ export function getEffectiveScope3Methodology(
   switch (category) {
     case 'cat4':
       if (inputs.scope3Cat4.methodologyBasis?.trim()) {
-        return inputs.scope3Cat4.methodologyBasis;
+        return `${inputs.scope3Cat4.methodologyBasis.trim()} (supplier-provided note)`;
       }
       return `Standard distance-based method using 2026 DESNZ factors for HGV (0.10478 kg/t-km) and Van (0.23512 kg/km). Parameters: ${inputs.scope3Cat4.hgvTonneKm} t-km HGV, ${inputs.scope3Cat4.vanKm} ${inputs.scope3Cat4.vanUnit} Van, Override: ${inputs.scope3Cat4.flatTCO2e} tCO2e.`;
     case 'cat5':
       if (inputs.scope3Cat5.methodologyBasis?.trim()) {
-        return inputs.scope3Cat5.methodologyBasis;
+        return `${inputs.scope3Cat5.methodologyBasis.trim()} (supplier-provided note)`;
       }
       if (useWasteBenchmark) {
-        return `UK Average Benchmarking: Estimated 0.2 tonnes of operational waste per employee per year for ${inputs.employeeHeadcount} employees (allocated 50% landfill, 50% recycling).`;
+        return `Estimated using general industry factor (0.2t per employee per year; 50/50 landfill/recycling split). This is an estimate; consider conducting a waste-audit for higher accuracy.`;
       }
       return `Waste tonnage method using 2026 factors: Landfill ${inputs.scope3Cat5.landfillTonnes}t, Combusted ${inputs.scope3Cat5.combustedTonnes}t, Recycled ${inputs.scope3Cat5.recycledTonnes}t, Composted ${inputs.scope3Cat5.compostedTonnes}t.`;
     case 'cat6':
       if (inputs.scope3Cat6.methodologyBasis?.trim()) {
-        return inputs.scope3Cat6.methodologyBasis;
+        return `${inputs.scope3Cat6.methodologyBasis.trim()} (supplier-provided note)`;
       }
       return `Passenger-kilometer (pkm) calculation using 2026 factors. Parameters: Rail: ${inputs.scope3Cat6.railPkm} pkm, Domestic flights: ${inputs.scope3Cat6.domesticFlightPkm} pkm, Short-haul: ${inputs.scope3Cat6.shortHaulFlightPkm} pkm, Long-haul: ${inputs.scope3Cat6.longHaulFlightPkm} pkm, Car: ${inputs.scope3Cat6.carKm} ${inputs.scope3Cat6.carUnit}, Bus: ${inputs.scope3Cat6.busPkm} pkm.`;
     case 'cat7':
       if (inputs.scope3Cat7.methodologyBasis?.trim()) {
-        return inputs.scope3Cat7.methodologyBasis;
+        return `${inputs.scope3Cat7.methodologyBasis.trim()} (supplier-provided note)`;
       }
       if (useCommutingBenchmark) {
-        return `UK DfT Commuting Benchmarking: Estimated travel distance (1,007 miles/employee/year) for ${inputs.employeeHeadcount} employees plus standard WFH teleworking energy allowance (0.34 kg CO2e/day) for telecommuters.`;
+        return `Estimated utilizing the UK Department for Transport (DfT) National Travel Survey average commute distance of approximately 631 miles per employee per year (Table NTS0409, basis: average commuting mileage per year per regular private vehicle driver).`;
       }
       return `Commuter vehicle mileage + teleworking allowance method. Parameters: Road: ${inputs.scope3Cat7.commuteCarKm} ${inputs.scope3Cat7.commuteCarUnit}, Rail: ${inputs.scope3Cat7.commuteRailKm} km, Bus: ${inputs.scope3Cat7.commuteBusKm} km. WFH: ${inputs.scope3Cat7.wfhDays} remote days.`;
     case 'cat9':
       if (inputs.scope3Cat9.methodologyBasis?.trim()) {
-        return inputs.scope3Cat9.methodologyBasis;
+        return `${inputs.scope3Cat9.methodologyBasis.trim()} (supplier-provided note)`;
       }
       return `Standard distance-based downstream logistics method using 2026 DESNZ factors. Parameters: ${inputs.scope3Cat9.hgvTonneKm} t-km HGV, ${inputs.scope3Cat9.vanKm} ${inputs.scope3Cat9.vanUnit} Van, Override: ${inputs.scope3Cat9.flatTCO2e} tCO2e.`;
     default:

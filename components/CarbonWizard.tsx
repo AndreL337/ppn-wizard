@@ -37,16 +37,41 @@ export default function CarbonWizard() {
   // Stripe & Preview/Methodology Modal states
   const [isUnlocked, setIsUnlocked] = useState<boolean>(false);
   const [isUnlocking, setIsUnlocking] = useState<boolean>(false);
+  const [stripeSessionId, setStripeSessionId] = useState<string | null>(null);
+  const [isBaselineSimulated, setIsBaselineSimulated] = useState<boolean>(false);
   const [showPreviewModal, setShowPreviewModal] = useState<boolean>(false);
   const [showMethodologyModal, setShowMethodologyModal] = useState<boolean>(false);
 
   // Handle Stripe Unlock Payment
   const handleUnlockPDF = async () => {
+    if (isBaselineSimulated) {
+      alert("Submission Blocked: You are using an illustrative baseline scenario. Please configure actual historical baseline data in Step 2 to unlock the official plan.");
+      return;
+    }
     setIsUnlocking(true);
     try {
+      // Ensure progress is saved to generate/update an audit report first
+      await handleSaveProgress();
+
+      const { data: reports } = await supabase
+        .from('audit_reports')
+        .select('id')
+        .eq('user_id', currentUser?.id)
+        .order('updated_at', { ascending: false })
+        .limit(1);
+
+      const reportId = reports && reports.length > 0 ? reports[0].id : null;
+
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
+
       const res = await fetch('/api/checkout', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token || ''}`
+        },
+        body: JSON.stringify({ reportId }),
       });
       const data = await res.json();
       if (data.url) {
@@ -62,24 +87,65 @@ export default function CarbonWizard() {
     }
   };
 
-  // Check URL query parameters and local storage for unlock state
+  // Check URL query parameters and local storage for unlock state using server-side verification
   React.useEffect(() => {
     if (typeof window !== 'undefined') {
-      const savedUnlock = localStorage.getItem('carbon_wizard_unlocked_plan');
-      if (savedUnlock === 'true') {
-        setIsUnlocked(true);
+      const verifySession = async (sid: string, isUrlParam = false) => {
+        try {
+          const { data: { session } } = await supabase.auth.getSession();
+          const token = session?.access_token;
+          const authedUserId = session?.user?.id;
+
+          let reportId = null;
+          if (authedUserId) {
+            const { data: reports } = await supabase
+              .from('audit_reports')
+              .select('id')
+              .eq('user_id', authedUserId)
+              .order('updated_at', { ascending: false })
+              .limit(1);
+            if (reports && reports.length > 0) {
+              reportId = reports[0].id;
+            }
+          }
+
+          const res = await fetch('/api/verify-payment', {
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token || ''}`
+            },
+            body: JSON.stringify({ sessionId: sid, reportId }),
+          });
+          const data = await res.json();
+          if (data.verified) {
+            setIsUnlocked(true);
+            setStripeSessionId(sid);
+            localStorage.setItem('carbon_wizard_stripe_session_id', sid);
+          } else if (!isUrlParam) {
+            // Clear invalid stored session
+            localStorage.removeItem('carbon_wizard_stripe_session_id');
+          }
+        } catch (err) {
+          console.error('Error verifying payment session:', err);
+        }
+      };
+
+      const storedSessionId = localStorage.getItem('carbon_wizard_stripe_session_id');
+      if (storedSessionId && !isUnlocked) {
+        verifySession(storedSessionId, false);
       }
 
       const params = new URLSearchParams(window.location.search);
-      if (params.get('payment') === 'success') {
-        setIsUnlocked(true);
-        localStorage.setItem('carbon_wizard_unlocked_plan', 'true');
-        // Clean URL params to avoid re-triggering success toasts
+      const urlSessionId = params.get('session_id');
+      if (params.get('payment') === 'success' && urlSessionId) {
+        verifySession(urlSessionId, true);
+        // Clean URL params to avoid re-triggering success toasts or raw keys
         const newUrl = window.location.pathname + window.location.hash;
         window.history.replaceState({}, '', newUrl);
       }
     }
-  }, []);
+  }, [currentUser, isUnlocked]);
 
   const handleSaveProgress = async () => {
     if (!currentUser) {
@@ -131,6 +197,7 @@ export default function CarbonWizard() {
           useElectricityBenchmark,
           useWasteBenchmark,
           useCommutingBenchmark,
+          isBaselineSimulated,
         },
         updated_at: new Date().toISOString()
       };
@@ -187,6 +254,7 @@ export default function CarbonWizard() {
               if (raw.useElectricityBenchmark !== undefined) setUseElectricityBenchmark(raw.useElectricityBenchmark);
               if (raw.useWasteBenchmark !== undefined) setUseWasteBenchmark(raw.useWasteBenchmark);
               if (raw.useCommutingBenchmark !== undefined) setUseCommutingBenchmark(raw.useCommutingBenchmark);
+              if (raw.isBaselineSimulated !== undefined) setIsBaselineSimulated(raw.isBaselineSimulated);
             }
           }
         } catch (err) {
@@ -198,11 +266,9 @@ export default function CarbonWizard() {
   }, [currentUser]);
 
   const saveAuditRecord = async (reportId?: string) => {
-    if (!currentUser) return null;
-    
     try {
       let finalReportId = reportId;
-      if (!finalReportId) {
+      if (currentUser && !finalReportId) {
         const { data: existingReports } = await supabase
           .from('audit_reports')
           .select('id')
@@ -214,7 +280,7 @@ export default function CarbonWizard() {
         }
       }
 
-      if (!finalReportId) {
+      if (currentUser && !finalReportId) {
         // Automatically save current draft first to ensure the audit report exists
         await handleSaveProgress();
         const { data: newReports } = await supabase
@@ -228,76 +294,37 @@ export default function CarbonWizard() {
         }
       }
 
-      if (!finalReportId) {
-        console.warn('Could not determine report ID for snapshot.');
-        return null;
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
+
+      // Call the secure server-side recomputation and auditing API
+      const res = await fetch('/api/finalize-audit', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token || ''}`
+        },
+        body: JSON.stringify({
+          inputs,
+          useGasBenchmark,
+          useElectricityBenchmark,
+          useWasteBenchmark,
+          useCommutingBenchmark,
+          sessionId: stripeSessionId,
+          reportId: finalReportId || null,
+          isBaselineSimulated,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Server calculation error');
       }
 
-      // Save factors snapshot to carbon_audits table
-      const { data: auditData, error: auditError } = await supabase
-        .from('carbon_audits')
-        .insert({
-          user_id: currentUser.id,
-          report_id: finalReportId,
-          factor_set_version: '2026-v1.0',
-          audited_factors_snapshot: EMISSION_FACTORS,
-        })
-        .select()
-        .single();
-
-      if (auditError) throw auditError;
-      if (!auditData) return null;
-
-      const auditId = auditData.id;
-
-      // Map Scope 3 calculation notes & methodology basis to scope3_records
-      const scope3Records = [
-        {
-          audit_id: auditId,
-          category: 'Category 4: Upstream Transportation & Distribution',
-          emissions_tco2e: reportingEmissions.scope3.cat4UpstreamTrans,
-          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat4'),
-          calculation_notes: JSON.stringify(inputs.scope3Cat4),
-        },
-        {
-          audit_id: auditId,
-          category: 'Category 5: Operational Waste',
-          emissions_tco2e: reportingEmissions.scope3.cat5OperationalWaste,
-          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat5', useWasteBenchmark, useCommutingBenchmark),
-          calculation_notes: JSON.stringify(inputs.scope3Cat5),
-        },
-        {
-          audit_id: auditId,
-          category: 'Category 6: Business Travel',
-          emissions_tco2e: reportingEmissions.scope3.cat6BusinessTravel,
-          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat6'),
-          calculation_notes: JSON.stringify(inputs.scope3Cat6),
-        },
-        {
-          audit_id: auditId,
-          category: 'Category 7: Employee Commuting',
-          emissions_tco2e: reportingEmissions.scope3.cat7EmployeeCommuting,
-          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat7', useWasteBenchmark, useCommutingBenchmark),
-          calculation_notes: JSON.stringify(inputs.scope3Cat7),
-        },
-        {
-          audit_id: auditId,
-          category: 'Category 9: Downstream Transportation & Distribution',
-          emissions_tco2e: reportingEmissions.scope3.cat9DownstreamTrans,
-          methodology_basis: getEffectiveScope3Methodology(inputs, 'cat9'),
-          calculation_notes: JSON.stringify(inputs.scope3Cat9),
-        },
-      ];
-
-      const { error: scope3Error } = await supabase
-        .from('scope3_records')
-        .insert(scope3Records);
-
-      if (scope3Error) throw scope3Error;
-      console.log('Successfully saved forensic audit snapshot and scope 3 records.');
-      return auditId;
+      console.log('Successfully saved forensic audit snapshot server-side:', data.auditId);
+      return data.auditId;
     } catch (error) {
-      console.error('Error saving forensic audit snapshot:', error);
+      console.error('Error finalising audit on server:', error);
       return null;
     }
   };
@@ -306,6 +333,10 @@ export default function CarbonWizard() {
   const [isDownloading, setIsDownloading] = useState<boolean>(false);
 
   const handleDownloadPDF = async () => {
+    if (isBaselineSimulated) {
+      alert("Submission Blocked: You are using an illustrative baseline scenario. Please configure actual historical baseline data in Step 2 to download the official PDF.");
+      return;
+    }
     const element = pdfTemplateRef.current;
     if (!element) return;
     setIsDownloading(true);
@@ -402,7 +433,7 @@ export default function CarbonWizard() {
         ...prev,
         scope3Cat7: {
           ...prev.scope3Cat7,
-          commuteCarKm: prev.employeeHeadcount * 1007,
+          commuteCarKm: prev.employeeHeadcount * 631,
         },
       }));
     }
@@ -488,7 +519,7 @@ export default function CarbonWizard() {
         ...prev,
         scope3Cat7: {
           ...prev.scope3Cat7,
-          commuteCarKm: prev.employeeHeadcount * 1007,
+          commuteCarKm: prev.employeeHeadcount * 631,
           commuteCarUnit: 'miles',
           commuteRailKm: 0,
           commuteBusKm: 0,
@@ -537,6 +568,7 @@ export default function CarbonWizard() {
     field: string,
     value: string | number
   ) => {
+    setIsBaselineSimulated(false);
     if (!baselineInputs) return;
     setBaselineInputs((prev) => {
       if (!prev) return null;
@@ -555,6 +587,7 @@ export default function CarbonWizard() {
   const handleAutoGenerateBaseline = () => {
     const generated = generateSampleBaseline(inputs);
     setBaselineInputs(generated);
+    setIsBaselineSimulated(true);
   };
 
   // Manual baseline creation
@@ -563,6 +596,7 @@ export default function CarbonWizard() {
     initial.organizationName = inputs.organizationName;
     initial.reportingYear = inputs.baselineYear;
     setBaselineInputs(initial);
+    setIsBaselineSimulated(false);
   };
 
   // Calculations
@@ -803,7 +837,7 @@ export default function CarbonWizard() {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                     </svg>
                     <div className="text-xs text-emerald-800 leading-relaxed">
-                      <strong>CIBSE Benchmark Applied</strong>: This estimation utilizes the official UK CIBSE (Chartered Institution of Building Services Engineers) Guide F average benchmark of <strong>1,200 kWh</strong> of natural gas per employee per year for standard commercial premises.
+                      <strong>CIBSE Benchmark Applied</strong>: This estimation utilizes the official UK CIBSE (Chartered Institution of Building Services Engineers) Guide F Table 20.1 average fossil-fuel thermal energy benchmark of <strong>120 kWh per m² of floor area</strong> per year. This is converted at an assumed employment density of <strong>10 m² per employee</strong> (from the UK Employment Density Guide) to yield a baseline of <strong>1,200 kWh</strong> of natural gas per employee per year.
                     </div>
                   </div>
                 )}
@@ -954,7 +988,7 @@ export default function CarbonWizard() {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                     </svg>
                     <div className="text-xs text-emerald-800 leading-relaxed">
-                      <strong>CIBSE Electricity Benchmarks Applied</strong>: This estimation utilizes the official UK CIBSE (Chartered Institution of Building Services Engineers) Guide F average benchmark of <strong>950 kWh</strong> of grid electricity per employee per year for commercial offices.
+                      <strong>CIBSE Electricity Benchmarks Applied</strong>: This estimation utilizes the official UK CIBSE (Chartered Institution of Building Services Engineers) Guide F Table 20.1 average electricity benchmark of <strong>95 kWh per m² of floor area</strong> per year. This is converted at an assumed employment density of <strong>10 m² per employee</strong> (from the UK Employment Density Guide) to yield a baseline of <strong>950 kWh</strong> of grid electricity per employee per year.
                     </div>
                   </div>
                 )}
@@ -1143,6 +1177,9 @@ export default function CarbonWizard() {
                             onChange={(e) => handleInputChange('scope3Cat4', 'methodologyBasis', e.target.value)}
                           />
                           <p className="text-[10px] text-slate-400">Specify any custom sampling techniques, supplier verification data, or data gaps addressed.</p>
+                          <p className="text-[10px] text-amber-600 font-medium mt-1">
+                            You are responsible for the accuracy of custom inputs. These notes are included in your official CRP.
+                          </p>
                         </div>
                       </div>
                     </div>
@@ -1256,6 +1293,9 @@ export default function CarbonWizard() {
                             onChange={(e) => handleInputChange('scope3Cat5', 'methodologyBasis', e.target.value)}
                           />
                           <p className="text-[10px] text-slate-400">Specify any custom waste tracking databases, dumpster volume estimations, or supplier data sheets used.</p>
+                          <p className="text-[10px] text-amber-600 font-medium mt-1">
+                            You are responsible for the accuracy of custom inputs. These notes are included in your official CRP.
+                          </p>
                         </div>
                       </div>
                     </div>
@@ -1368,6 +1408,9 @@ export default function CarbonWizard() {
                           onChange={(e) => handleInputChange('scope3Cat6', 'methodologyBasis', e.target.value)}
                         />
                         <p className="text-[10px] text-slate-400">Specify travel agent report imports, mileage expense claims database sources, or airline class radiative forcing adjustments applied.</p>
+                        <p className="text-[10px] text-amber-600 font-medium mt-1">
+                          You are responsible for the accuracy of custom inputs. These notes are included in your official CRP.
+                        </p>
                       </div>
                     </div>
                   )}
@@ -1406,7 +1449,7 @@ export default function CarbonWizard() {
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                           </svg>
                           <div className="text-xs text-emerald-800 leading-relaxed">
-                            <strong>UK DfT Commuting Benchmark Applied</strong>: This estimation utilizes the UK Department for Transport (DfT) National Travel Survey average commute distance of approximately <strong>1,007 miles</strong> per employee per year for private transport users.
+                            <strong>UK DfT Commuting Benchmark Applied</strong>: This estimation utilizes the UK Department for Transport (DfT) National Travel Survey average commute distance of approximately <strong>631 miles</strong> per employee per year (Table NTS0409, basis: average commuting mileage per year per regular private vehicle driver).
                           </div>
                         </div>
                       )}
@@ -1444,7 +1487,7 @@ export default function CarbonWizard() {
                           />
                           {useCommutingBenchmark && (
                             <span className="text-[10px] text-emerald-700 font-bold uppercase tracking-wider block mt-1">
-                              ★ Auto-populated (1,007 miles/employee/yr)
+                              ★ Auto-populated (631 miles/employee/yr)
                             </span>
                           )}
                         </div>
@@ -1501,6 +1544,9 @@ export default function CarbonWizard() {
                             onChange={(e) => handleInputChange('scope3Cat7', 'methodologyBasis', e.target.value)}
                           />
                           <p className="text-[10px] text-slate-400">Specify any commuting surveys administered, average distance estimations, or teleworking energy calculation models used.</p>
+                          <p className="text-[10px] text-amber-600 font-medium mt-1">
+                            You are responsible for the accuracy of custom inputs. These notes are included in your official CRP.
+                          </p>
                         </div>
                       </div>
                     </div>
@@ -1579,6 +1625,9 @@ export default function CarbonWizard() {
                             onChange={(e) => handleInputChange('scope3Cat9', 'methodologyBasis', e.target.value)}
                           />
                           <p className="text-[10px] text-slate-400">Specify any downstream carrier logistics data sets, weight-mileage estimations, or distributor telemetry logs analyzed.</p>
+                          <p className="text-[10px] text-amber-600 font-medium mt-1">
+                            You are responsible for the accuracy of custom inputs. These notes are included in your official CRP.
+                          </p>
                         </div>
                       </div>
                     </div>
@@ -1689,21 +1738,26 @@ export default function CarbonWizard() {
                         </p>
                       </div>
                     </div>
-                    <div className="flex gap-3">
-                      <button
-                        type="button"
-                        onClick={handleAutoGenerateBaseline}
-                        className="bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg transition-colors shadow-sm"
-                      >
-                        Auto-Generate Benchmark Baseline (+25%)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleEnableManualBaseline}
-                        className="bg-white border border-amber-300 text-amber-800 hover:bg-amber-100 text-xs font-bold px-4 py-2.5 rounded-lg transition-colors"
-                      >
-                        Manually Configure Baseline
-                      </button>
+                    <div className="flex flex-col gap-2">
+                      <div className="flex gap-3">
+                        <button
+                          type="button"
+                          onClick={handleAutoGenerateBaseline}
+                          className="bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg transition-colors shadow-sm"
+                        >
+                          Model Illustrative Scenario (+25%) — NOT for submission
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleEnableManualBaseline}
+                          className="bg-white border border-amber-300 text-amber-800 hover:bg-amber-100 text-xs font-bold px-4 py-2.5 rounded-lg transition-colors"
+                        >
+                          Manually Configure Baseline
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-amber-700 leading-normal mt-1">
+                        <strong>Note:</strong> Illustrative scenario baselines are strictly for internal testing and modeling. Reports using modeled baselines are locked and blocked from official signable PDF export or certification.
+                      </p>
                     </div>
                   </div>
                 ) : (
@@ -1735,6 +1789,11 @@ export default function CarbonWizard() {
                         </p>
                       </div>
                     </div>
+                    {isBaselineSimulated && (
+                      <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-[11px] text-amber-800 leading-normal">
+                        <strong>Simulated Scenario Active:</strong> This baseline is modeled using an illustrative calculation (+25% multiplier) and is <strong>not valid for formal PPN 06/21 submission</strong>. You must clear or update these values manually with actual historical data to unlock official signable PDF downloads.
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
